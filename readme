@@ -1,0 +1,16 @@
+## DATASET ##
+Ce qui a changé
+Classe renommée : VisibilityDataset → DroneNoiseMeshDataset, avec trois nouveaux arguments d'entrée — areas (aires des faces), et les paramètres de normalisation spl_mean/spl_std.
+Features redessinées pour l'acoustique (13 au lieu de 11) — organisées en trois groupes :
+#FeatureJustification acoustique1-3NormalesRéflexion/absorption selon l'incidence4cos(θ) normal/sourceIncidence directe5Angle rasantFort impact sur la réflexion spéculaire6Élévation de la sourceEffet de masque par le bâti7log10(distance)Loi en 1/r² (atténuation géométrique)8Ombre acoustiqueVoisins plus hauts entre le nœud et la source9Proximité obstacleZones de diffraction10Discontinuité penteArêtes vives = diffraction11Angle horizontalRéflexion latérale12log10(aire face)Pondération surfacique de la réception13Hauteur normaliséeGradient vertical en milieu urbain
+
+
+Q : Qu'est-ce que ton modèle doit prédire pour chaque noeud du maillage ?
+R : Un niveau sonore en dB (valeur continue)
+
+Q : Comment sont structurées tes données de maillage ?
+R : J'ai des faces triangulaires avec leur centroid + normale + connectivité entre faces
+
+Q : Est-ce que le collate_fn (qui assemble un batch) doit aussi produire la matrice indiquant quels noeuds sont voisins (nécessaire pour le GAT) ?
+R : Oui, via les K plus proches voisins en distance (KNN)
+
