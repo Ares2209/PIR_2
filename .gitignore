@@ -32,3 +32,20 @@ Thumbs.db
 
 # Jupyter
 .ipynb_checkpoints/
+
+F-4/
+I2/
+M2/
+S-9/
+_tmp/
+
+data/
+dataset/
+dataset/data/
+dataset/data/generated/
+results/
+these/
+
+checkpoints/
+
+.pt

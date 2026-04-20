@@ -1,16 +1,23 @@
-## DATASET ##
-Ce qui a changé
-Classe renommée : VisibilityDataset → DroneNoiseMeshDataset, avec trois nouveaux arguments d'entrée — areas (aires des faces), et les paramètres de normalisation spl_mean/spl_std.
-Features redessinées pour l'acoustique (13 au lieu de 11) — organisées en trois groupes :
-#FeatureJustification acoustique1-3NormalesRéflexion/absorption selon l'incidence4cos(θ) normal/sourceIncidence directe5Angle rasantFort impact sur la réflexion spéculaire6Élévation de la sourceEffet de masque par le bâti7log10(distance)Loi en 1/r² (atténuation géométrique)8Ombre acoustiqueVoisins plus hauts entre le nœud et la source9Proximité obstacleZones de diffraction10Discontinuité penteArêtes vives = diffraction11Angle horizontalRéflexion latérale12log10(aire face)Pondération surfacique de la réception13Hauteur normaliséeGradient vertical en milieu urbain
+3. Split train/val/test non géré ici
+Tu as 5 villes × 4 drones × 100 points. Si infer.py ou le training fait un split aléatoire par graphe, tu verras la même ville en train et test → généralisation inter-villes invérifiable. Il faut splitter par map_name. À vérifier côté GCN.
 
+🟡 Problèmes de design
+4. Features redondantes
+cos_ns = dot(normal, dir_to_src) est exactement calculable depuis les features [4:7] × [7:10]. Pas fatal (la redondance peut aider un GCN qui n'aime pas les produits scalaires), mais à noter.
 
-Q : Qu'est-ce que ton modèle doit prédire pour chaque noeud du maillage ?
-R : Un niveau sonore en dB (valeur continue)
+5. Stats de normalisation "analytiques" potentiellement fausses
+NODE_STATS["normal"] = (0.0, 0.577) suppose une distribution uniforme sur la sphère. Sur une ville, tu as un biais vertical massif (toits = nz≈+1, murs = nz≈0). Le mean de nz est loin de zéro.
+NODE_STATS["log_area"] = (0.0, 1.0) — à mesurer empiriquement, ça dépend de la résolution du mesh Blender.
+→ Calcule les stats offline sur le dataset réel (premier passage sans normalisation, mean/std, puis sauvegarde), plutôt que poser des valeurs analytiques.
 
-Q : Comment sont structurées tes données de maillage ?
-R : J'ai des faces triangulaires avec leur centroid + normale + connectivité entre faces
+6. Rotation inter-villes en frame monde
+Les normal et dir_to_src sont en world frame. Entre villes, les axes X/Y sont orientés arbitrairement (Blender). Ton "pas de fuite géographique" tient pour la translation, mais pas pour la rotation. Deux villes avec la même géométrie mais tournées de 90° auront des features différentes. Solutions :
 
-Q : Est-ce que le collate_fn (qui assemble un batch) doit aussi produire la matrice indiquant quels noeuds sont voisins (nécessaire pour le GAT) ?
-R : Oui, via les K plus proches voisins en distance (KNN)
+Aligner toutes les villes sur une orientation canonique (PCA sur XY + Z-up).
+Ou modèle equivariant SE(2).
+7. Arêtes binaires, pas pondérées
+Tu construis l'adjacence de faces sans info géométrique sur l'arête partagée. Pour un problème acoustique, des poids comme la longueur d'arête partagée ou l'angle dièdre aideraient la propagation dans le GCN. edge_attr est gratuit à ajouter.
+
+8. drone_feat shape (1, 51) per-graph
+OK, mais vérifie côté GCN.py que c'est bien broadcast sur tous les nœuds au forward. En PyG avec batching, c'est souvent un piège.
 
