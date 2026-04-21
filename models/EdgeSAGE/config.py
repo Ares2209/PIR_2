@@ -1,4 +1,4 @@
-"""Hyperparameters for the GCN model. Edit values here to tune training."""
+"""Hyperparameters for the EdgeSAGE model. Edit values here to tune training."""
 
 # Model architecture
 HIDDEN_CHANNELS = 64

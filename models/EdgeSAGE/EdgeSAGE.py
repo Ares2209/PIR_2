@@ -1,8 +1,13 @@
-"""Node-level 7-class GCN trained on the NoiseMap graphs built by
+"""Node-level 7-class EdgeSAGE trained on the NoiseMap graphs built by
 `dataset/data/generated/build_graphs.py`. Each graph = one noise map,
 nodes = mesh faces, features = face geometry + drone acoustic signature
 (LP_REF spectrum + slope + META), labels = color class (0:violet, 1:blue,
 2:yellow, 3:orange, 4:red, 5:dark_red, 6:occluded).
+
+EdgeSAGEConv = SAGE-style aggregation with edge-aware messages:
+  message(j→i) = MLP([h_j, h_j - h_i])   (edge-conditioned, like EdgeConv)
+  aggregate    = mean over neighbours    (GraphSAGE mean aggregator)
+  update       = Linear([h_i, aggr])     (SAGE self/neighbour concat)
 """
 import argparse
 import contextlib
@@ -28,13 +33,13 @@ from sklearn.metrics import (
     recall_score,
 )
 from torch_geometric.loader import DataLoader
-from torch_geometric.nn import GCNConv
+from torch_geometric.nn import MessagePassing
 from tqdm import tqdm
 
 import config
 from log_utils import get_logger
 
-log = get_logger("gcn.train")
+log = get_logger("edgesage.train")
 
 ROOT = Path(__file__).resolve().parents[2]
 DATA_FILE = ROOT / "dataset" / "data" / "generated" / "processed" / "graphs.pt"
@@ -153,8 +158,34 @@ val_loader = DataLoader(val_set, batch_size=args.batch_size, pin_memory=_pin)
 test_loader = DataLoader(test_set, batch_size=args.batch_size, pin_memory=_pin)
 
 
-class GCN(torch.nn.Module):
-    """GCN with additive drone-signature fusion.
+class EdgeSAGEConv(MessagePassing):
+    """SAGE-style convolution with edge-aware messages.
+
+    Combines EdgeConv (edge-conditioned message via [h_j, h_j - h_i]) with
+    GraphSAGE's self/neighbour concat update — keeps the edge geometry signal
+    while retaining the node's own representation across layers.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__(aggr="mean")
+        self.edge_mlp = torch.nn.Sequential(
+            torch.nn.Linear(2 * in_channels, out_channels),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Linear(out_channels, out_channels),
+        )
+        self.lin_self = torch.nn.Linear(in_channels, out_channels)
+        self.lin_out = torch.nn.Linear(2 * out_channels, out_channels)
+
+    def forward(self, x, edge_index):
+        aggr = self.propagate(edge_index, x=x)
+        return self.lin_out(torch.cat([self.lin_self(x), aggr], dim=-1))
+
+    def message(self, x_i, x_j):
+        return self.edge_mlp(torch.cat([x_j, x_j - x_i], dim=-1))
+
+
+class EdgeSAGE(torch.nn.Module):
+    """EdgeSAGE with additive drone-signature fusion.
 
     The drone signature is projected once per graph (B × hidden) and broadcast
     to nodes via `batch`, rather than concatenated to every node feature vector
@@ -167,7 +198,7 @@ class GCN(torch.nn.Module):
         self.node_proj = torch.nn.Linear(num_node_features, hidden_channels)
         self.drone_proj = torch.nn.Linear(num_drone_features, hidden_channels)
         self.convs = torch.nn.ModuleList(
-            [GCNConv(hidden_channels, hidden_channels) for _ in range(num_layers)]
+            [EdgeSAGEConv(hidden_channels, hidden_channels) for _ in range(num_layers)]
         )
         self.norms = torch.nn.ModuleList(
             [torch.nn.LayerNorm(hidden_channels) for _ in range(num_layers)]
@@ -183,8 +214,8 @@ class GCN(torch.nn.Module):
         return self.output_proj(h)
 
 
-model = GCN(num_node_features, num_drone_features, args.hidden_channels,
-            num_classes, args.dropout, args.num_layers).to(device)
+model = EdgeSAGE(num_node_features, num_drone_features, args.hidden_channels,
+                 num_classes, args.dropout, args.num_layers).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
     optimizer, mode="max", factor=args.lr_factor,
@@ -275,14 +306,14 @@ def save_if_better(val_mcc, val_acc, test_mcc, test_acc, epoch, state, prev_mcc)
     OLD_DIR.mkdir(parents=True, exist_ok=True)
     if val_mcc <= prev_mcc + args.min_delta:
         return False
-    for p in CKPT_DIR.glob("gcn_*.pt"):
+    for p in CKPT_DIR.glob("edgesage_*.pt"):
         shutil.move(str(p), str(OLD_DIR / p.name))
-    name = (f"gcn_epoch{epoch:03d}_mcc{val_mcc:.4f}_acc{val_acc:.4f}"
+    name = (f"edgesage_epoch{epoch:03d}_mcc{val_mcc:.4f}_acc{val_acc:.4f}"
             f"_testmcc{test_mcc:.4f}_testacc{test_acc:.4f}.pt")
     torch.save(state, CKPT_DIR / name)
     # Rotate old checkpoints: keep only the most recent N in ./old/
     if args.keep_old_ckpts >= 0:
-        olds = sorted(OLD_DIR.glob("gcn_*.pt"), key=lambda p: p.stat().st_mtime)
+        olds = sorted(OLD_DIR.glob("edgesage_*.pt"), key=lambda p: p.stat().st_mtime)
         for p in olds[:-args.keep_old_ckpts] if args.keep_old_ckpts else olds:
             p.unlink(missing_ok=True)
     log.success(f"saved new best → {name} (prev MCC={prev_mcc:.4f})")
@@ -499,10 +530,11 @@ def _save_history_plots(hist, best_epoch, out_dir):
     stamp = time.strftime("%Y%m%d_%H%M%S")
     ep = np.array(hist["epoch"])
 
-    # --- Global metrics: loss / accuracy / MCC ---
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig, axes = plt.subplots(3, 3, figsize=(18, 15))
+
+    # --- Row 0: global metrics (loss / accuracy / MCC) ---
     for ax, key, title in zip(
-        axes, ["loss", "acc", "mcc"], ["Loss", "Accuracy", "MCC"]
+        axes[0], ["loss", "acc", "mcc"], ["Loss", "Accuracy", "MCC"]
     ):
         if key == "loss":
             ax.plot(ep, hist["train_loss"], label="train")
@@ -516,13 +548,33 @@ def _save_history_plots(hist, best_epoch, out_dir):
         ax.set_title(f"{title} per epoch")
         ax.grid(alpha=0.3)
         ax.legend()
+
+    # --- Rows 1-2: per-class precision / recall / F1 (val then test) ---
+    for row, split in enumerate(("val", "test"), start=1):
+        prec = np.array(hist[f"{split}_prec"])
+        rec = np.array(hist[f"{split}_rec"])
+        f1 = np.array(hist[f"{split}_f1"])
+        for ax, arr, title in zip(
+            axes[row], [prec, rec, f1], ["Precision", "Recall", "F1"]
+        ):
+            for c in range(arr.shape[1]):
+                ax.plot(ep, arr[:, c], label=f"class {c}")
+            if best_epoch:
+                ax.axvline(best_epoch, color="red", linestyle="--", alpha=0.5)
+            ax.set_xlabel("Epoch")
+            ax.set_ylabel(title)
+            ax.set_title(f"{split.upper()} — {title} per class")
+            ax.set_ylim(-0.02, 1.02)
+            ax.grid(alpha=0.3)
+            ax.legend(fontsize=8)
+
     fig.tight_layout()
     p = out_dir / f"metrics_{stamp}.png"
     fig.savefig(p, dpi=120)
     plt.close(fig)
     log.success(f"saved {p}")
 
-    # --- Learning-rate curve ---
+    # --- Learning-rate curve (separate figure, log scale) ---
     if hist.get("lr"):
         fig, ax = plt.subplots(figsize=(8, 4))
         ax.plot(ep, hist["lr"])
@@ -537,31 +589,6 @@ def _save_history_plots(hist, best_epoch, out_dir):
         ax.grid(alpha=0.3)
         fig.tight_layout()
         p = out_dir / f"lr_{stamp}.png"
-        fig.savefig(p, dpi=120)
-        plt.close(fig)
-        log.success(f"saved {p}")
-
-    # --- Per-class precision / recall / F1 (val + test) ---
-    for split in ("val", "test"):
-        prec = np.array(hist[f"{split}_prec"])
-        rec = np.array(hist[f"{split}_rec"])
-        f1 = np.array(hist[f"{split}_f1"])
-        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-        for ax, arr, title in zip(
-            axes, [prec, rec, f1], ["Precision", "Recall", "F1"]
-        ):
-            for c in range(arr.shape[1]):
-                ax.plot(ep, arr[:, c], label=f"class {c}")
-            if best_epoch:
-                ax.axvline(best_epoch, color="red", linestyle="--", alpha=0.5)
-            ax.set_xlabel("Epoch")
-            ax.set_ylabel(title)
-            ax.set_title(f"{split.upper()} — {title} per class")
-            ax.set_ylim(-0.02, 1.02)
-            ax.grid(alpha=0.3)
-            ax.legend(fontsize=8)
-        fig.tight_layout()
-        p = out_dir / f"per_class_{split}_{stamp}.png"
         fig.savefig(p, dpi=120)
         plt.close(fig)
         log.success(f"saved {p}")
