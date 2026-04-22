@@ -1,13 +1,13 @@
-"""Run a trained 7-class GCN on a base mesh to produce a face-colored
+"""Run a trained 7-class EdgeSAGE on a base mesh to produce a face-colored
 noise-map PLY for a given drone and source position.
 
 Feature construction is imported from `gen_graphs` to guarantee training
 and inference stay in sync.
 
 Usage:
-    python models/infer.py --drone M2 --x 1.2 --y -3.4 --z 0.5
-    python models/infer.py --drone F-4 --x 0 --y 0 --z 1 \\
-        --ckpt models/GCN/checkpoints/.../gcn_*.pt
+    python models/EdgeSAGE/infer.py --drone M2 --x 1.2 --y -3.4 --z 0.5
+    python models/EdgeSAGE/infer.py --drone F-4 --x 0 --y 0 --z 1 \\
+        --ckpt models/EdgeSAGE/checkpoints/.../edgesage_*.pt
 """
 import argparse
 import re
@@ -18,13 +18,11 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv
+from torch_geometric.nn import MessagePassing
 
-ROOT = Path(__file__).resolve().parents[1]
-GEN_DIR = ROOT / "dataset" / "data" / "generated"
-GCN_DIR = ROOT / "models" / "GCN"
-sys.path.insert(0, str(GEN_DIR))
-sys.path.insert(0, str(GCN_DIR))
+ROOT = Path(__file__).resolve().parents[2]
+EDGESAGE_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(EDGESAGE_DIR))
 
 from gen_graphs import (  # noqa: E402
     DRONES, NUM_FEATURES, RGB_TO_CLASS,
@@ -32,11 +30,11 @@ from gen_graphs import (  # noqa: E402
 )
 from log_utils import get_logger  # noqa: E402
 
-log = get_logger("gcn.infer")
+log = get_logger("edgesage.infer")
 
 VILLE_PLY = ROOT / "dataset" / "blender" / "ville.ply"
-CKPT_DIR = GCN_DIR / "checkpoints"
-OUT_DIR = GCN_DIR / "predictions"
+CKPT_DIR = EDGESAGE_DIR / "checkpoints"
+OUT_DIR = EDGESAGE_DIR / "predictions"
 NOISEMAP_DIR = ROOT / "dataset" / "data" / "NoiseMap-RT-main"
 NOISEMAP_BIN = NOISEMAP_DIR / "build" / "NoiseMap"
 
@@ -52,15 +50,36 @@ CLASS_TO_RGB = np.array([
 ], dtype=np.uint8)
 
 
-class GCN(torch.nn.Module):
-    """Mirrors models/GCN/GCN.py:GCN — must stay in sync."""
+class EdgeSAGEConv(MessagePassing):
+    """Mirrors models/EdgeSAGE/EdgeSAGE.py:EdgeSAGEConv — must stay in sync."""
+
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__(aggr="mean")
+        self.edge_mlp = torch.nn.Sequential(
+            torch.nn.Linear(2 * in_channels, out_channels),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Linear(out_channels, out_channels),
+        )
+        self.lin_self = torch.nn.Linear(in_channels, out_channels)
+        self.lin_out = torch.nn.Linear(2 * out_channels, out_channels)
+
+    def forward(self, x, edge_index):
+        aggr = self.propagate(edge_index, x=x)
+        return self.lin_out(torch.cat([self.lin_self(x), aggr], dim=-1))
+
+    def message(self, x_i, x_j):
+        return self.edge_mlp(torch.cat([x_j, x_j - x_i], dim=-1))
+
+
+class EdgeSAGE(torch.nn.Module):
+    """Mirrors models/EdgeSAGE/EdgeSAGE.py:EdgeSAGE — must stay in sync."""
     def __init__(self, num_node_features, num_drone_features, hidden_channels,
                  out_channels, dropout, num_layers):
         super().__init__()
         self.node_proj = torch.nn.Linear(num_node_features, hidden_channels)
         self.drone_proj = torch.nn.Linear(num_drone_features, hidden_channels)
         self.convs = torch.nn.ModuleList(
-            [GCNConv(hidden_channels, hidden_channels) for _ in range(num_layers)]
+            [EdgeSAGEConv(hidden_channels, hidden_channels) for _ in range(num_layers)]
         )
         self.norms = torch.nn.ModuleList(
             [torch.nn.LayerNorm(hidden_channels) for _ in range(num_layers)]
@@ -86,7 +105,7 @@ def rgb_to_class_exact(rgb: np.ndarray) -> np.ndarray:
 
 def pick_best_ckpt():
     best, best_mcc = None, -2.0
-    for p in CKPT_DIR.rglob("gcn_*.pt"):
+    for p in CKPT_DIR.rglob("edgesage_*.pt"):
         if "old" in p.parts:
             continue
         m = re.search(r"mcc([-+]?\d*\.\d+)", p.name)
@@ -147,7 +166,7 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info(f"Using device: {device}")
-    model = GCN(
+    model = EdgeSAGE(
         ckpt["num_node_features"],
         ckpt["num_drone_features"],
         ckpt["args"]["hidden_channels"],
@@ -288,7 +307,7 @@ def make_plots(centroids, pred_cls, gt_cls, pred_counts, gt_counts, cm, per_cls,
                 s=2, marker=".")
     ax2.scatter([args.x], [args.y], c="red", marker="*", s=120,
                 edgecolors="black", linewidths=0.7)
-    ax2.set_title("GCN prediction")
+    ax2.set_title("EdgeSAGE prediction")
     ax2.set_xlabel("x"); ax2.set_ylabel("y"); ax2.set_aspect("equal")
 
     ax3 = fig.add_subplot(2, 3, 3)

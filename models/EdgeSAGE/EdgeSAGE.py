@@ -55,6 +55,9 @@ parser.add_argument("--weight_decay", type=float, default=config.WEIGHT_DECAY)
 parser.add_argument("--epochs", type=int, default=config.EPOCHS)
 parser.add_argument("--batch_size", type=int, default=config.BATCH_SIZE)
 parser.add_argument("--grad_clip", type=float, default=config.GRAD_CLIP)
+parser.add_argument("--grad_accum_steps", type=int, default=config.GRAD_ACCUM_STEPS,
+                    help="Accumulate gradients over N mini-batches before "
+                         "optimizer.step() — effective batch = batch_size * N")
 parser.add_argument("--val_ratio", type=float, default=config.VAL_RATIO)
 parser.add_argument("--test_ratio", type=float, default=config.TEST_RATIO)
 parser.add_argument("--split_seed", type=int, default=config.SPLIT_SEED)
@@ -64,7 +67,6 @@ parser.add_argument("--patience", type=int, default=config.PATIENCE,
                     help="Early stopping: stop after N epochs without val MCC improvement")
 parser.add_argument("--min_delta", type=float, default=config.MIN_DELTA,
                     help="Minimum val MCC gain to count as improvement")
-parser.add_argument("--focal_gamma", type=float, default=config.FOCAL_GAMMA)
 parser.add_argument("--eval_every", type=int, default=config.EVAL_EVERY,
                     help="Run val/test every N epochs (epoch 1 and last always evaluated)")
 parser.add_argument("--lr_factor", type=float, default=config.LR_FACTOR)
@@ -124,26 +126,27 @@ log.info(f"Map-level split | train={len(train_maps)} maps ({len(train_idx)} grap
          f"| val={len(val_maps)} ({len(val_idx)}) | test={len(test_maps)} ({len(test_idx)})")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Focal-loss alpha computed from the TRAIN split class distribution
-# (inverse-sqrt frequency, min-normalised so the smallest weight is 1.0).
+# Class weights for weighted cross-entropy, computed from the TRAIN split
+# class distribution (inverse-sqrt frequency, mean-normalised so the weights
+# average to 1.0 — keeps the loss scale stable regardless of batch composition).
 # ─────────────────────────────────────────────────────────────────────────────
 train_counts = np.zeros(num_classes, dtype=np.int64)
 for i in train_idx:
     train_counts += np.asarray(metas[i]["class_counts"], dtype=np.int64)
 _safe_counts = np.maximum(train_counts, 1)
-_raw_alpha = 1.0 / np.sqrt(_safe_counts.astype(np.float64))
-focal_alpha_np = (_raw_alpha / _raw_alpha.min()).astype(np.float32)
+_raw_weights = 1.0 / np.sqrt(_safe_counts.astype(np.float64))
+class_weights_np = (_raw_weights / _raw_weights.mean()).astype(np.float32)
 log.info(f"Train class counts : {train_counts.tolist()}")
-log.info(f"Focal alpha (auto) : [{', '.join(f'{a:.3f}' for a in focal_alpha_np)}]")
+log.info(f"Class weights      : [{', '.join(f'{w:.3f}' for w in class_weights_np)}]")
 
 
-def _run_dirname(args, focal_alpha):
-    alpha_str = "-".join(f"{a:.2f}" for a in focal_alpha)
+def _run_dirname(args, class_weights):
+    w_str = "-".join(f"{w:.2f}" for w in class_weights)
     return (f"lr{args.lr:.0e}_wd{args.weight_decay:.0e}_bs{args.batch_size}"
-            f"__fa{alpha_str}_fg{args.focal_gamma:g}")
+            f"__cw{w_str}")
 
 
-CKPT_DIR = CKPT_ROOT / _run_dirname(args, focal_alpha_np.tolist())
+CKPT_DIR = CKPT_ROOT / _run_dirname(args, class_weights_np.tolist())
 OLD_DIR = CKPT_DIR / "old"
 
 test_set = [graphs[i] for i in test_idx]
@@ -230,6 +233,8 @@ amp_ctx = (
     if _use_bf16 else contextlib.nullcontext
 )
 log.info(f"AMP bfloat16: {_use_bf16}")
+log.info(f"Batch size: {args.batch_size} × grad_accum {args.grad_accum_steps} "
+         f"= effective {args.batch_size * args.grad_accum_steps}")
 
 try:
     model = torch.compile(model)
@@ -237,36 +242,38 @@ try:
 except Exception as e:
     log.warning(f"torch.compile: disabled ({e})")
 
-focal_alpha = torch.tensor(focal_alpha_np, device=device)
-focal_gamma = args.focal_gamma
+class_weights = torch.tensor(class_weights_np, device=device)
 
 
-def focal_loss(logits, target):
-    logp = F.log_softmax(logits, dim=-1)
-    logp_t = logp.gather(1, target.unsqueeze(1)).squeeze(1)
-    p_t = logp_t.exp()
-    alpha_t = focal_alpha[target]
-    return -(alpha_t * (1 - p_t).pow(focal_gamma) * logp_t).mean()
+def weighted_ce_loss(logits, target):
+    return F.cross_entropy(logits, target, weight=class_weights)
 
 
 def train_step(epoch: int | None = None):
     model.train()
     total_loss = total_nodes = 0
+    accum_steps = max(1, args.grad_accum_steps)
     desc = f"train ep{epoch:03d}" if epoch is not None else "train"
     pbar = tqdm(train_loader, desc=desc, leave=False, unit="batch",
                 dynamic_ncols=True)
-    for batch in pbar:
+    optimizer.zero_grad(set_to_none=True)
+    n_batches = len(train_loader)
+    for step, batch in enumerate(pbar):
         batch = batch.to(device, non_blocking=True)
-        optimizer.zero_grad(set_to_none=True)
         with amp_ctx():
             out = model(batch.x, batch.edge_index, batch.drone_feat, batch.batch)
-            loss = focal_loss(out, batch.y)
-        loss.backward()
-        if args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        optimizer.step()
+            loss = weighted_ce_loss(out, batch.y)
+        (loss / accum_steps).backward()
         total_loss += float(loss) * batch.num_nodes
         total_nodes += batch.num_nodes
+        # Step on every accum_steps-th batch, plus a final flush so leftover
+        # gradients at the end of the epoch are not silently dropped.
+        is_step = (step + 1) % accum_steps == 0 or (step + 1) == n_batches
+        if is_step:
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
         pbar.set_postfix(loss=f"{total_loss / max(total_nodes, 1):.4f}")
     return total_loss / total_nodes
 
@@ -281,7 +288,7 @@ def evaluate(loader, desc: str = "eval"):
         batch = batch.to(device, non_blocking=True)
         with amp_ctx():
             out = model(batch.x, batch.edge_index, batch.drone_feat, batch.batch)
-            loss = focal_loss(out, batch.y)
+            loss = weighted_ce_loss(out, batch.y)
         total_loss += float(loss) * batch.num_nodes
         total_nodes += batch.num_nodes
         preds_all.append(out.argmax(dim=-1).cpu())
@@ -392,7 +399,7 @@ try:
                 "num_node_features": num_node_features,
                 "num_drone_features": num_drone_features,
                 "num_classes": num_classes,
-                "focal_alpha": focal_alpha_np.tolist(),
+                "class_weights": class_weights_np.tolist(),
                 "train_class_counts": train_counts.tolist(),
                 "test_maps": sorted(test_maps),
                 "val_maps": sorted(val_maps),

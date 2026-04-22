@@ -6,11 +6,15 @@ NUM_LAYERS = 5
 DROPOUT = 0.2
 
 # Optimization
-LR = 1E-4
+LR = 5E-5
 WEIGHT_DECAY = 5E-5
 EPOCHS = 300
 BATCH_SIZE = 4
 GRAD_CLIP = 1.0
+# Gradient accumulation: simulate a larger effective batch (= BATCH_SIZE *
+# GRAD_ACCUM_STEPS) by accumulating grads across N mini-batches before stepping.
+# Keeps memory low while reducing per-step gradient noise.
+GRAD_ACCUM_STEPS = 4
 
 # Dataset split (group-split by map name to prevent inter-city leakage)
 VAL_RATIO = 0.15
@@ -31,10 +35,6 @@ MIN_DELTA = 1e-4
 LR_FACTOR = 0.5
 LR_PATIENCE = 10
 LR_MIN = 1e-6
-
-# Focal loss — alpha is auto-computed at train time from the training-split
-# class distribution (inverse-sqrt freq, min-normalized). Only gamma is fixed.
-FOCAL_GAMMA = 2.0
 
 # Checkpoint rotation: how many previous best checkpoints to keep in ./old/
 KEEP_OLD_CHECKPOINTS = 3

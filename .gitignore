@@ -47,5 +47,8 @@ results/
 these/
 
 checkpoints/
+generated/
+
+NoiseMap-RT-main/
 
 .pt
