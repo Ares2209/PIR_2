@@ -1,14 +1,4 @@
-"""
-Configuration partagée pour EdgeSAGE.
-
-Contient :
-  - Hyperparams du modèle (HIDDEN_CHANNELS, LR, …)
-  - Chemins (dataset shardé, stats JSON, blender meshes)
-  - Constantes du dataset (DRONES, META, RGB_TO_CLASS, …)
-  - Définitions de features (FEAT_KEYS, NODE_STATS, NUM_FEATURES, …)
-  - Fonctions partagées (_parse_ply, _face_adjacency, _normalize_…)
-  - Auto-load des stats depuis processed/node_stats.json à l'import
-"""
+"""Hyperparameters for the GAT model. Edit values here to tune training."""
 
 from __future__ import annotations
 
@@ -20,16 +10,15 @@ from typing import Optional
 
 import numpy as np
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Hyperparams (model + training)
-# ─────────────────────────────────────────────────────────────────────────────
+# Model architecture
 HIDDEN_CHANNELS = 64
-NUM_LAYERS      = 5
-DROPOUT         = 0.2
+NUM_LAYERS      = 3
+NUM_HEADS       = 4          
+ATTN_DROPOUT    = 0.2        
+DROPOUT         = 0.2       
 
-LR               = 5E-4
-WEIGHT_DECAY     = 5E-5
+LR               = 5e-4
+WEIGHT_DECAY     = 5e-5
 EPOCHS           = 300
 BATCH_SIZE       = 4
 GRAD_CLIP        = 1.0
@@ -49,7 +38,6 @@ LR_PATIENCE = 10
 LR_MIN      = 1e-6
 
 KEEP_OLD_CHECKPOINTS = 3
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Chemins

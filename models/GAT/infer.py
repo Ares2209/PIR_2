@@ -1,15 +1,10 @@
-"""Run a trained 7-class EdgeSAGE on a base mesh to produce a face-colored
+"""Run a trained 7-class GAT on a base mesh to produce a face-colored
 noise-map PLY for a given drone and source position.
 
-Feature construction is imported from `gen_graphs` to guarantee training
-and inference stay in sync.
-
 Usage:
-    python models/EdgeSAGE/infer.py --drone M2 --x 1.2 --y -3.4 --z 0.5
-    python models/EdgeSAGE/infer.py --drone F-4 --x 4 --y 4 --z 4 --ckpt models/EdgeSAGE/checkpoints/lr5e-05_wd5e-05_bs4__cw0.20-0.17-0.33-0.61-1.46-4.09-0.14/edgesage_epoch060_mcc0.6356_acc0.7365_testmcc0.6146_testacc0.7243.pt
+    python models/GAT/infer.py --drone M2 --x 1.2 --y -3.4 --z 0.5
+    python models/GAT/infer.py --drone F-4 --x 4 --y 4 --z 4 --ckpt /home/ldena/Bureau/PIR/models/GAT/checkpoints/lr5e-04_wd5e-05_bs4__cw0.20-0.17-0.33-0.61-1.46-4.09-0.14/gat_epoch045_mcc0.5626_acc0.6847_testmcc0.5509_testacc0.6788.pt
 """
-
-
 
 import argparse
 import re
@@ -20,27 +15,32 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch_geometric.nn import MessagePassing
+from torch_geometric.nn import GATConv
 
-ROOT = Path(__file__).resolve().parents[2]
-EDGESAGE_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(EDGESAGE_DIR))
+ROOT    = Path(__file__).resolve().parents[2]
+GAT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(GAT_DIR))
 
-from gen_graphs import (  # noqa: E402
-    DRONES, NUM_FEATURES, RGB_TO_CLASS,
-    _face_adjacency, _parse_ply, build_node_features,
+# Tout vient de config.py — gen_graphs.py n'exporte pas de fonctions publiques
+from config import (  # noqa: E402
+    DRONES, NUM_FEATURES, DRONE_FEAT_DIM, RGB_TO_CLASS,
+    _parse_ply, _face_adjacency, _normalize_drone_vector,
+    _load_base_mesh, _OCC_CHUNK,
 )
 from log_utils import get_logger  # noqa: E402
 
-log = get_logger("edgesage.infer")
+# Import de la construction des features (définie dans gen_graphs)
+sys.path.insert(0, str(ROOT / "dataset" / "data" / "generated"))
+from gen_graphs import _build_node_features, _compute_occlusion  # noqa: E402
 
-VILLE_PLY = ROOT / "dataset" / "blender" / "ville.ply"
-CKPT_DIR = EDGESAGE_DIR / "checkpoints"
-OUT_DIR = EDGESAGE_DIR / "predictions"
+log = get_logger("gat.infer")
+
+VILLE_PLY    = ROOT / "dataset" / "blender" / "ville.ply"
+CKPT_DIR     = GAT_DIR / "checkpoints"
+OUT_DIR      = GAT_DIR / "predictions"
 NOISEMAP_DIR = ROOT / "dataset" / "data" / "NoiseMap-RT-main"
 NOISEMAP_BIN = NOISEMAP_DIR / "build" / "NoiseMap"
 
-# Canonical RGB per class for writing predictions.
 CLASS_TO_RGB = np.array([
     [128,   0, 200],  # 0 violet
     [  0,  80, 255],  # 1 blue
@@ -52,42 +52,25 @@ CLASS_TO_RGB = np.array([
 ], dtype=np.uint8)
 
 
-class EdgeSAGEConv(MessagePassing):
-    """Mirrors models/EdgeSAGE/EdgeSAGE.py:EdgeSAGEConv — must stay in sync."""
-
-    def __init__(self, in_channels: int, out_channels: int):
-        super().__init__(aggr="mean")
-        self.edge_mlp = torch.nn.Sequential(
-            torch.nn.Linear(2 * in_channels, out_channels),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.Linear(out_channels, out_channels),
-        )
-        self.lin_self = torch.nn.Linear(in_channels, out_channels)
-        self.lin_out = torch.nn.Linear(2 * out_channels, out_channels)
-
-    def forward(self, x, edge_index):
-        aggr = self.propagate(edge_index, x=x)
-        return self.lin_out(torch.cat([self.lin_self(x), aggr], dim=-1))
-
-    def message(self, x_i, x_j):
-        return self.edge_mlp(torch.cat([x_j, x_j - x_i], dim=-1))
-
-
-class EdgeSAGE(torch.nn.Module):
-    """Mirrors models/EdgeSAGE/EdgeSAGE.py:EdgeSAGE — must stay in sync."""
+# ─────────────────────────────────────────────────────────────────────────────
+# Model — must mirror GAT.py exactly
+# ─────────────────────────────────────────────────────────────────────────────
+class GAT(torch.nn.Module):
     def __init__(self, num_node_features, num_drone_features, hidden_channels,
-                 out_channels, dropout, num_layers):
+                 out_channels, dropout, attn_dropout, num_layers, num_heads):
         super().__init__()
-        self.node_proj = torch.nn.Linear(num_node_features, hidden_channels)
+        self.node_proj  = torch.nn.Linear(num_node_features,  hidden_channels)
         self.drone_proj = torch.nn.Linear(num_drone_features, hidden_channels)
-        self.convs = torch.nn.ModuleList(
-            [EdgeSAGEConv(hidden_channels, hidden_channels) for _ in range(num_layers)]
-        )
-        self.norms = torch.nn.ModuleList(
-            [torch.nn.LayerNorm(hidden_channels) for _ in range(num_layers)]
-        )
+        self.convs = torch.nn.ModuleList([
+            GATConv(hidden_channels, hidden_channels,
+                    heads=num_heads, concat=False, dropout=attn_dropout)
+            for _ in range(num_layers)
+        ])
+        self.norms = torch.nn.ModuleList([
+            torch.nn.LayerNorm(hidden_channels) for _ in range(num_layers)
+        ])
         self.output_proj = torch.nn.Linear(hidden_channels, out_channels)
-        self.dropout = dropout
+        self.dropout     = dropout
 
     def forward(self, x, edge_index, drone_feat, batch):
         h = self.node_proj(x) + self.drone_proj(drone_feat)[batch]
@@ -97,8 +80,10 @@ class EdgeSAGE(torch.nn.Module):
         return self.output_proj(h)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 def rgb_to_class_exact(rgb: np.ndarray) -> np.ndarray:
-    """Map simulator RGB exactly to class id. Unknown -> -1."""
     y = np.full(rgb.shape[0], -1, dtype=np.int64)
     for (r, g, b), c in RGB_TO_CLASS.items():
         y[(rgb[:, 0] == r) & (rgb[:, 1] == g) & (rgb[:, 2] == b)] = c
@@ -107,7 +92,7 @@ def rgb_to_class_exact(rgb: np.ndarray) -> np.ndarray:
 
 def pick_best_ckpt():
     best, best_mcc = None, -2.0
-    for p in CKPT_DIR.rglob("edgesage_*.pt"):
+    for p in CKPT_DIR.rglob("gat_*.pt"):
         if "old" in p.parts:
             continue
         m = re.search(r"mcc([-+]?\d*\.\d+)", p.name)
@@ -118,7 +103,6 @@ def pick_best_ckpt():
 
 
 def write_ply_face_colors(path, verts, faces, face_rgb):
-    """Write an ASCII PLY with uncolored vertices and RGB colors per face."""
     with open(path, "w") as f:
         f.write("ply\nformat ascii 1.0\n")
         f.write(f"element vertex {len(verts)}\n")
@@ -147,19 +131,44 @@ def run_noisemap(ville_path: Path, drone, x, y, z) -> Path:
     return ville_abs.with_name(ville_abs.stem + "_noisemap.ply")
 
 
+def _load_and_normalize_stats(ckpt: dict) -> tuple[np.ndarray, np.ndarray] | None:
+    """Charge mean/std depuis le checkpoint si disponible."""
+    mean = ckpt.get("node_mean")
+    std  = ckpt.get("node_std")
+    if mean is not None and std is not None:
+        return np.array(mean, dtype=np.float32), np.array(std, dtype=np.float32)
+    # Fallback : node_stats.json à côté des shards
+    stats_path = ROOT / "dataset" / "data" / "generated" / "processed" / "node_stats.json"
+    if stats_path.exists():
+        import json
+        with stats_path.open() as f:
+            stats = json.load(f)
+        from config import FEAT_KEYS
+        mean = np.array([stats[k][0] for k in FEAT_KEYS], dtype=np.float32)
+        std  = np.array([stats[k][1] for k in FEAT_KEYS], dtype=np.float32)
+        log.info(f"Loaded normalisation stats from {stats_path}")
+        return mean, std
+    log.warning("No normalisation stats found — features will NOT be normalised.")
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--drone", required=True, choices=DRONES)
-    ap.add_argument("--x", type=float, required=True)
-    ap.add_argument("--y", type=float, required=True)
-    ap.add_argument("--z", type=float, required=True)
-    ap.add_argument("--ckpt", type=str, default=None)
-    ap.add_argument("--ville", type=str, default=str(VILLE_PLY))
-    ap.add_argument("--out", type=str, default=None)
+    ap.add_argument("--drone",      required=True, choices=DRONES)
+    ap.add_argument("--x",          type=float, required=True)
+    ap.add_argument("--y",          type=float, required=True)
+    ap.add_argument("--z",          type=float, required=True)
+    ap.add_argument("--ckpt",       type=str, default=None)
+    ap.add_argument("--ville",      type=str, default=str(VILLE_PLY))
+    ap.add_argument("--out",        type=str, default=None)
     ap.add_argument("--no-compare", action="store_true",
                     help="Skip running NoiseMap ground truth comparison")
     args = ap.parse_args()
 
+    # ── Checkpoint ────────────────────────────────────────────────────────────
     ckpt_path = Path(args.ckpt) if args.ckpt else pick_best_ckpt()
     if ckpt_path is None or not ckpt_path.exists():
         raise FileNotFoundError(f"No checkpoint found in {CKPT_DIR}")
@@ -168,56 +177,75 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info(f"Using device: {device}")
-    model = EdgeSAGE(
-        ckpt["num_node_features"],
-        ckpt["num_drone_features"],
-        ckpt["args"]["hidden_channels"],
-        ckpt["num_classes"],
-        ckpt["args"].get("dropout", 0.0),
-        ckpt["args"].get("num_layers", 5),
+
+    # ── Modèle ────────────────────────────────────────────────────────────────
+    model = GAT(
+        num_node_features  = ckpt["num_node_features"],
+        num_drone_features = ckpt["num_drone_features"],
+        hidden_channels    = ckpt["args"]["hidden_channels"],
+        out_channels       = ckpt["num_classes"],
+        dropout            = ckpt["args"].get("dropout",      0.0),
+        attn_dropout       = ckpt["args"].get("attn_dropout", 0.0),
+        num_layers         = ckpt["args"].get("num_layers",   5),
+        num_heads          = ckpt["args"].get("num_heads",    4),
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
-    log.info(f"Parsing mesh: {args.ville}")
-    verts, faces, _ = _parse_ply(Path(args.ville))
-    src = np.array([args.x, args.y, args.z], dtype=np.float32)
+    # ── Mesh ──────────────────────────────────────────────────────────────────
+    ville_path = Path(args.ville)
+    log.info(f"Parsing mesh: {ville_path}")
+    verts, faces, _ = _parse_ply(ville_path)
+    map_name        = ville_path.stem          # e.g. "ville"
+    src             = np.array([args.x, args.y, args.z], dtype=np.float32)
 
-    # Features built via the same pipeline as the training dataset.
-    feats, drone_feat_np, centroids = build_node_features(
-        verts, faces, src, args.drone, normalize=True
-    )
-    assert feats.shape[1] == NUM_FEATURES, feats.shape
-    ei = _face_adjacency(faces)
+    # ── Features (même pipeline que gen_graphs.py) ────────────────────────────
+    feats = _build_node_features(verts, faces, src, map_name)  # (M, NUM_FEATURES)
+    assert feats.shape[1] == NUM_FEATURES, \
+        f"Feature dim mismatch: got {feats.shape[1]}, expected {NUM_FEATURES}"
 
-    # build_node_features already normalises both node and drone features
-    # (gen_graphs.py is the single source of truth) — no extra rescaling here.
-    x_t = torch.from_numpy(feats).to(device)
-    df_t = torch.from_numpy(drone_feat_np).to(device)
-    ei_t = torch.from_numpy(ei).long().to(device)
+    # Normalisation
+    norm_stats = _load_and_normalize_stats(ckpt)
+    if norm_stats is not None:
+        mean, std = norm_stats
+        feats = (feats - mean) / std
+
+    drone_feat_np = _normalize_drone_vector(args.drone)        # (DRONE_FEAT_DIM,)
+    ei            = _face_adjacency(faces)                     # (2, E)
+
+    # Centroïdes pour les plots
+    v0 = verts[faces[:, 0]]; v1 = verts[faces[:, 1]]; v2 = verts[faces[:, 2]]
+    centroids = (v0 + v1 + v2) / 3.0
+
+    x_t       = torch.from_numpy(feats).to(device)
+    df_t      = torch.from_numpy(drone_feat_np).unsqueeze(0).to(device)  # (1, DRONE_FEAT_DIM)
+    ei_t      = torch.from_numpy(ei).long().to(device)
     batch_vec = torch.zeros(x_t.shape[0], dtype=torch.long, device=device)
+
+    # ── Inférence ─────────────────────────────────────────────────────────────
     with torch.no_grad():
         logits = model(x_t, ei_t, df_t, batch_vec)
-        cls = logits.argmax(dim=-1).cpu().numpy()
+        cls    = logits.argmax(dim=-1).cpu().numpy()
 
     rgb_out = CLASS_TO_RGB[cls]
+    counts  = np.bincount(cls, minlength=ckpt["num_classes"])
+    log.info(f"Class distribution (pred): {counts.tolist()}")
 
+    # ── Écriture PLY prédiction ───────────────────────────────────────────────
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     out_name = args.out or (
         f"NoiseMap_{args.x:.4f}_{args.y:.4f}_{args.z:.4f}_{args.drone}_pred.ply"
     )
     out_path = OUT_DIR / out_name
     write_ply_face_colors(out_path, verts, faces, rgb_out)
-
-    counts = np.bincount(cls, minlength=ckpt["num_classes"])
-    log.info(f"Class distribution (pred): {counts.tolist()}")
     log.success(f"Written: {out_path}")
 
     if args.no_compare:
         return
+
+    # ── Ground truth via NoiseMap ─────────────────────────────────────────────
     try:
-        noisemap_out = run_noisemap(Path(args.ville), args.drone,
-                                    args.x, args.y, args.z)
+        noisemap_out = run_noisemap(ville_path, args.drone, args.x, args.y, args.z)
         gt_verts, gt_faces, gt_rgb = _parse_ply(noisemap_out)
     except (FileNotFoundError, subprocess.CalledProcessError) as e:
         log.warning(f"Ground-truth comparison skipped: {e}")
@@ -229,19 +257,18 @@ def main():
     if gt_faces.shape[0] != faces.shape[0]:
         log.warning(f"Face count mismatch: pred={faces.shape[0]} gt={gt_faces.shape[0]} — "
                     "matching by nearest centroid.")
-        gt_c = (gt_verts[gt_faces[:, 0]] + gt_verts[gt_faces[:, 1]]
-                + gt_verts[gt_faces[:, 2]]) / 3.0
+        gt_c = ((gt_verts[gt_faces[:, 0]] + gt_verts[gt_faces[:, 1]]
+                 + gt_verts[gt_faces[:, 2]]) / 3.0)
         try:
             from scipy.spatial import cKDTree
-            tree = cKDTree(gt_c)
-            _, nn = tree.query(centroids, k=1)
+            _, nn = cKDTree(gt_c).query(centroids, k=1)
         except ImportError:
             diffs = centroids[:, None, :] - gt_c[None, :, :]
-            nn = np.argmin(np.linalg.norm(diffs, axis=-1), axis=-1)
+            nn    = np.argmin(np.linalg.norm(diffs, axis=-1), axis=-1)
         gt_rgb = gt_rgb[nn]
 
     gt_cls = rgb_to_class_exact(gt_rgb)
-    valid = gt_cls >= 0
+    valid  = gt_cls >= 0
     if not valid.any():
         log.warning("Ground-truth comparison skipped: no classifiable GT faces.")
         return
@@ -251,13 +278,14 @@ def main():
     try:
         from sklearn.metrics import confusion_matrix, matthews_corrcoef
         mcc = matthews_corrcoef(gt_cls[valid], cls[valid])
-        cm = confusion_matrix(gt_cls[valid], cls[valid],
-                              labels=list(range(ckpt["num_classes"])))
+        cm  = confusion_matrix(gt_cls[valid], cls[valid],
+                               labels=list(range(ckpt["num_classes"])))
     except Exception:
         mcc, cm = float("nan"), None
 
     log.info(f"Class distribution (gt):   {gt_counts.tolist()}")
     log.success(f"Accuracy vs NoiseMap: {acc:.4f} | MCC: {mcc:.4f}")
+
     per_cls = (np.diag(cm) / np.maximum(gt_counts, 1)
                if cm is not None else None)
     if per_cls is not None:
@@ -269,7 +297,7 @@ def main():
             log.info("  " + " ".join(f"{v:6d}" for v in row))
 
     gt_rgb_out = CLASS_TO_RGB[np.where(valid, gt_cls, 0)]
-    gt_path = OUT_DIR / out_name.replace("_pred.ply", "_gt.ply")
+    gt_path    = OUT_DIR / out_name.replace("_pred.ply", "_gt.ply")
     write_ply_face_colors(gt_path, verts, faces, gt_rgb_out)
     log.success(f"Written GT: {gt_path}")
 
@@ -279,6 +307,9 @@ def main():
     log.success(f"Written plots: {plot_path}")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Plots
+# ─────────────────────────────────────────────────────────────────────────────
 def make_plots(centroids, pred_cls, gt_cls, pred_counts, gt_counts, cm, per_cls,
                acc, mcc, args, out_path):
     import matplotlib
@@ -286,10 +317,10 @@ def make_plots(centroids, pred_cls, gt_cls, pred_counts, gt_counts, cm, per_cls,
     import matplotlib.pyplot as plt
     from matplotlib.colors import BoundaryNorm, ListedColormap
 
-    K = len(CLASS_TO_RGB)
+    K       = len(CLASS_TO_RGB)
     palette = (CLASS_TO_RGB / 255.0).clip(0, 1)
-    cmap = ListedColormap(palette)
-    norm = BoundaryNorm(np.arange(K + 1) - 0.5, K)
+    cmap    = ListedColormap(palette)
+    norm    = BoundaryNorm(np.arange(K + 1) - 0.5, K)
 
     fig = plt.figure(figsize=(16, 10))
     fig.suptitle(f"Drone {args.drone} — source ({args.x}, {args.y}, {args.z}) "
@@ -309,7 +340,7 @@ def make_plots(centroids, pred_cls, gt_cls, pred_counts, gt_counts, cm, per_cls,
                 s=2, marker=".")
     ax2.scatter([args.x], [args.y], c="red", marker="*", s=120,
                 edgecolors="black", linewidths=0.7)
-    ax2.set_title("EdgeSAGE prediction")
+    ax2.set_title("GAT prediction")
     ax2.set_xlabel("x"); ax2.set_ylabel("y"); ax2.set_aspect("equal")
 
     ax3 = fig.add_subplot(2, 3, 3)
@@ -325,16 +356,13 @@ def make_plots(centroids, pred_cls, gt_cls, pred_counts, gt_counts, cm, per_cls,
     ax3.legend(loc="upper right", fontsize=8)
 
     ax4 = fig.add_subplot(2, 3, 4)
-    idx = np.arange(K)
-    w = 0.4
-    ax4.bar(idx - w / 2, gt_counts, w, label="GT",
+    idx = np.arange(K); w = 0.4
+    ax4.bar(idx - w / 2, gt_counts,   w, label="GT",
             color=palette, edgecolor="black")
     ax4.bar(idx + w / 2, pred_counts, w, label="Pred",
             color=palette, edgecolor="black", hatch="//")
-    ax4.set_xticks(idx)
-    ax4.set_xlabel("class"); ax4.set_ylabel("# faces")
-    ax4.set_title("Class distribution")
-    ax4.legend()
+    ax4.set_xticks(idx); ax4.set_xlabel("class"); ax4.set_ylabel("# faces")
+    ax4.set_title("Class distribution"); ax4.legend()
 
     ax5 = fig.add_subplot(2, 3, 5)
     if cm is not None:
@@ -353,8 +381,7 @@ def make_plots(centroids, pred_cls, gt_cls, pred_counts, gt_counts, cm, per_cls,
     ax6 = fig.add_subplot(2, 3, 6)
     if per_cls is not None:
         ax6.bar(idx, per_cls, color=palette, edgecolor="black")
-        ax6.set_ylim(0, 1.05)
-        ax6.set_xticks(idx)
+        ax6.set_ylim(0, 1.05); ax6.set_xticks(idx)
         ax6.set_xlabel("class"); ax6.set_ylabel("recall")
         ax6.set_title("Per-class recall")
         for i, r in enumerate(per_cls):
