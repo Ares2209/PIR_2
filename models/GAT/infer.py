@@ -38,7 +38,7 @@ log = get_logger("gat.infer")
 VILLE_PLY    = ROOT / "dataset" / "blender" / "ville.ply"
 CKPT_DIR     = GAT_DIR / "checkpoints"
 OUT_DIR      = GAT_DIR / "predictions"
-NOISEMAP_DIR = ROOT / "dataset" / "data" / "NoiseMap-RT-main"
+NOISEMAP_DIR = ROOT / "NoiseMap-RT-main"
 NOISEMAP_BIN = NOISEMAP_DIR / "build" / "NoiseMap"
 
 CLASS_TO_RGB = np.array([
