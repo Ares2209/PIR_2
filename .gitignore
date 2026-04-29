@@ -33,19 +33,10 @@ Thumbs.db
 # Jupyter
 .ipynb_checkpoints/
 
-F-4/
-I2/
-M2/
-S-9/
-_tmp/
-
 dataset/data/generated/NoiseMap-RT-main/
 results/
 these/
 
 checkpoints/
-generated/
-
-NoiseMap-RT-main/
 
 .pt
