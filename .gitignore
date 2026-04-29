@@ -39,10 +39,7 @@ M2/
 S-9/
 _tmp/
 
-data/
-dataset/
-dataset/data/
-dataset/data/generated/
+dataset/data/generated/NoiseMap-RT-main/
 results/
 these/
 
