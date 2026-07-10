@@ -1,0 +1,17 @@
+{
+  "metric": "f1m,mcc",
+  "metric_names": [
+    "f1m",
+    "mcc"
+  ],
+  "value": 0.761888123617039,
+  "trial": 53,
+  "best_lr": 0.0005407835674001513,
+  "best_weight_decay": 5.024783335894379e-06,
+  "params": {
+    "lr": 0.0005407835674001513,
+    "weight_decay": 5.024783335894379e-06
+  },
+  "n_completed": 30,
+  "n_pruned": 30
+}

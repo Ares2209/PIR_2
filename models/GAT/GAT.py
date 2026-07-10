@@ -8,416 +8,162 @@ GATConv = multi-head graph attention with residual connection:
   attention(i,j) = softmax(LeakyReLU(a^T [W h_i || W h_j]))
   aggregate      = weighted sum over neighbours
   update         = Linear([h_i, aggr])  (self/neighbour concat, SAGE-style)
+
+Usage:
+    python models/GAT/GAT.py [args]
+
+The script auto-detects the number of visible CUDA devices. If more than one
+is available, it re-execs itself under `torch.distributed.run` (= torchrun)
+with `--nproc_per_node = device_count()` so DDP picks up every GPU. Restrict
+the GPUs used by setting `CUDA_VISIBLE_DEVICES` before launching, e.g.
+`CUDA_VISIBLE_DEVICES=0 python models/GAT/GAT.py` to force single-GPU.
+
 """
+# ---------------------------------------------------------------------------
+# Auto-launch under torchrun when multiple GPUs are visible.
+# Done before the heavy imports so the parent process exits quickly.
+# ---------------------------------------------------------------------------
 import argparse
-import contextlib
 import os
+import sys
+os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+# Dormammu: GPU 5 is hardware-faulty (corrupts VRAM under NCCL load → illegal
+# memory access). Exclude it by default; override by setting CUDA_VISIBLE_DEVICES
+# explicitly. Must precede the device_count() probe and torchrun re-exec below.
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,6,7")
+
+if "WORLD_SIZE" not in os.environ:
+    try:
+        import torch as _torch_probe
+        _n_gpus_detected = (_torch_probe.cuda.device_count()
+                            if _torch_probe.cuda.is_available() else 0)
+    except Exception:
+        _n_gpus_detected = 0
+    if _n_gpus_detected > 1:
+        print(f"[GAT] Detected {_n_gpus_detected} CUDA devices — re-launching "
+              f"with torch.distributed.run (--nproc_per_node={_n_gpus_detected})",
+              flush=True)
+        _cmd = [sys.executable, "-m", "torch.distributed.run",
+                "--standalone", f"--nproc_per_node={_n_gpus_detected}",
+                os.path.abspath(__file__)] + sys.argv[1:]
+        os.execvp(_cmd[0], _cmd)
+
 import random
-from re import A
-import shutil
 import time
 from pathlib import Path
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.nn.functional as F
-from sklearn.metrics import (
-    balanced_accuracy_score,
-    cohen_kappa_score,
-    confusion_matrix,
-    f1_score,
-    matthews_corrcoef,
-    precision_recall_fscore_support,
-    recall_score,
-)
-from torch_geometric.loader import DataLoader
-from torch_geometric.nn import GATConv
+from sklearn.metrics import precision_recall_fscore_support
+from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 
 import config
-from config import (
-    ATTN_DROPOUT, SHARD_DIR, NUM_CLASSES, NUM_FEATURES, DRONE_FEAT_DIM,
-    load_sharded_dataset,
+from config import ATTN_DROPOUT, DRONE_FEAT_DIM, NUM_CLASSES, NUM_FEATURES, SHARD_DIR
+from core import (
+    GAT,
+    Trainer,
+    broadcast_decision,
+    get_logger,
+    init_distributed,
+    per_class_report,
+    rank_aware_logger,
+    run_dirname,
+    save_checkpoint,
+    teardown_distributed,
+    unwrap_module,
 )
-from log_utils import get_logger
+from dataio import (
+    build_loaders,
+    compute_class_weights,
+    finalize_run_artifacts,
+    load_dataset,
+    make_run_dir,
+    map_level_split,
+    save_history_plots,
+    save_training_config,
+)
 
-log = get_logger("gat.train")
 
-ROOT      = Path(__file__).resolve().parents[2]
 CKPT_ROOT = Path(__file__).resolve().parent / "checkpoints"
 PLOTS_DIR = Path(__file__).resolve().parent / "plots"
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--hidden_channels", type=int, default=config.HIDDEN_CHANNELS)
-parser.add_argument("--num_layers", type=int, default=config.NUM_LAYERS)
-parser.add_argument("--num_heads", type=int, default=config.NUM_HEADS)
-parser.add_argument("--dropout", type=float, default=config.DROPOUT)
-parser.add_argument("--lr", type=float, default=config.LR)
-parser.add_argument("--weight_decay", type=float, default=config.WEIGHT_DECAY)
-parser.add_argument("--epochs", type=int, default=config.EPOCHS)
-parser.add_argument("--batch_size", type=int, default=config.BATCH_SIZE)
-parser.add_argument("--grad_clip", type=float, default=config.GRAD_CLIP)
-parser.add_argument("--grad_accum_steps", type=int, default=config.GRAD_ACCUM_STEPS)
-parser.add_argument("--val_ratio", type=float, default=config.VAL_RATIO)
-parser.add_argument("--test_ratio", type=float, default=config.TEST_RATIO)
-parser.add_argument("--split_seed", type=int, default=config.SPLIT_SEED)
-parser.add_argument("--seed", type=int, default=config.SEED)
-parser.add_argument("--patience", type=int, default=config.PATIENCE)
-parser.add_argument("--min_delta", type=float, default=config.MIN_DELTA)
-parser.add_argument("--eval_every", type=int, default=config.EVAL_EVERY)
-parser.add_argument("--lr_factor", type=float, default=config.LR_FACTOR)
-parser.add_argument("--lr_patience", type=int, default=config.LR_PATIENCE)
-parser.add_argument("--lr_min", type=float, default=config.LR_MIN)
-parser.add_argument("--keep_old_ckpts", type=int, default=config.KEEP_OLD_CHECKPOINTS)
-args = parser.parse_args()
+_STOP_LABEL = {
+    "completed":         "Training completed (all epochs)",
+    "max_epochs":        "Training completed (all epochs)",
+    "early_stopping":    "Training stopped early (patience exhausted)",
+    "manual_interrupt":  "Training stopped manually (KeyboardInterrupt)",
+}
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser()
+    p.add_argument("--hidden_channels", type=int, default=config.HIDDEN_CHANNELS)
+    p.add_argument("--num_layers", type=int, default=config.NUM_LAYERS)
+    p.add_argument("--num_heads", type=int, default=config.NUM_HEADS)
+    p.add_argument("--dropout", type=float, default=config.DROPOUT)
+    p.add_argument("--lr", type=float, default=config.LR)
+    p.add_argument("--weight_decay", type=float, default=config.WEIGHT_DECAY)
+    p.add_argument("--epochs", type=int, default=config.EPOCHS)
+    p.add_argument("--batch_size", type=int, default=config.BATCH_SIZE)
+    p.add_argument("--grad_clip", type=float, default=config.GRAD_CLIP)
+    p.add_argument("--grad_accum_steps", type=int, default=config.GRAD_ACCUM_STEPS)
+    p.add_argument("--val_ratio", type=float, default=config.VAL_RATIO)
+    p.add_argument("--test_ratio", type=float, default=config.TEST_RATIO)
+    p.add_argument("--split_seed", type=int, default=config.SPLIT_SEED)
+    p.add_argument("--seed", type=int, default=config.SEED)
+    p.add_argument("--patience", type=int, default=config.PATIENCE)
+    p.add_argument("--min_delta", type=float, default=config.MIN_DELTA)
+    p.add_argument("--eval_every", type=int, default=config.EVAL_EVERY)
+    p.add_argument("--lr_factor", type=float, default=config.LR_FACTOR)
+    p.add_argument("--lr_patience", type=int, default=config.LR_PATIENCE)
+    p.add_argument("--lr_min", type=float, default=config.LR_MIN)
+    p.add_argument("--keep_old_ckpts", type=int, default=config.KEEP_OLD_CHECKPOINTS)
+    p.add_argument(
+        "--grad_checkpoint", action=argparse.BooleanOptionalAction, default=True,
+        help="Activation checkpointing per GATConv layer. Default ON: cuts "
+             "activation memory ~num_layers× (lets you push hidden_channels) at "
+             "~25-30%% compute cost. Disable with --no-grad_checkpoint if you "
+             "have plenty of VRAM headroom and want max throughput.",
+    )
+    p.add_argument(
+        "--compile", action=argparse.BooleanOptionalAction, default=True,
+        help="Wrap the model in torch.compile. Default ON for speed. Disable "
+             "with --no-compile to rule out compile codegen bugs (e.g. CUDA "
+             "illegal memory access with checkpointing + bf16 + DDP).",
+    )
+    p.add_argument(
+        "--track_metric", type=str, default="f1m,mcc",
+        help="Comma-separated list of validation metrics that drive best-ckpt "
+             "selection, early-stopping and the LR scheduler (arithmetic mean). "
+             "Available: bal, acc, mcc, f1m, kap, rare. Default: 'f1m,mcc'.",
+    )
+    return p
 
 
-def seed_everything(seed: int):
+# eval_out tuple from Trainer.evaluate:
+#   (loss, acc, mcc, bal, f1m, kap, rare, preds, targets)
+_EVAL_METRIC_INDICES = {"acc": 1, "mcc": 2, "bal": 3, "f1m": 4, "kap": 5, "rare": 6}
+
+
+def _parse_track_metric(spec: str) -> list[tuple[str, int]]:
+    """Parse 'f1m,mcc' → [('f1m', 4), ('mcc', 2)]."""
+    names = [p.strip() for p in spec.split(",") if p.strip()]
+    if not names:
+        raise ValueError(f"empty --track_metric spec: {spec!r}")
+    unknown = [n for n in names if n not in _EVAL_METRIC_INDICES]
+    if unknown:
+        raise ValueError(
+            f"unknown metric(s) {unknown}; "
+            f"available: {sorted(_EVAL_METRIC_INDICES)}"
+        )
+    return [(n, _EVAL_METRIC_INDICES[n]) for n in names]
+
+def _seed_everything(seed: int) -> None:
     os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-
-seed_everything(args.seed)
-log.info(f"Seed: {args.seed}")
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-log.info(f"Using device: {device}")
-
-log.info(f"Loading sharded dataset from {SHARD_DIR}")
-graphs, metas      = load_sharded_dataset(SHARD_DIR)
-num_classes        = NUM_CLASSES
-num_node_features  = NUM_FEATURES
-num_drone_features = DRONE_FEAT_DIM
-log.info(f"Loaded {len(graphs)} graphs | node_feat={num_node_features} "
-         f"drone_feat={num_drone_features} | classes={num_classes}")
-
-map_names = [m["map"] for m in metas]
-unique_maps = sorted(set(map_names))
-map_rng = torch.Generator().manual_seed(args.split_seed)
-map_perm = torch.randperm(len(unique_maps), generator=map_rng).tolist()
-
-n_test_maps = max(1, int(round(len(unique_maps) * args.test_ratio)))
-n_val_maps  = max(1, int(round(len(unique_maps) * args.val_ratio)))
-test_maps  = {unique_maps[i] for i in map_perm[:n_test_maps]}
-val_maps   = {unique_maps[i] for i in map_perm[n_test_maps:n_test_maps + n_val_maps]}
-train_maps = {unique_maps[i] for i in map_perm[n_test_maps + n_val_maps:]}
-
-test_idx  = [i for i, m in enumerate(map_names) if m in test_maps]
-val_idx   = [i for i, m in enumerate(map_names) if m in val_maps]
-train_idx = [i for i, m in enumerate(map_names) if m in train_maps]
-
-log.info(f"Map-level split | train={len(train_maps)} maps ({len(train_idx)} graphs) "
-         f"| val={len(val_maps)} ({len(val_idx)}) | test={len(test_maps)} ({len(test_idx)})")
-
-train_counts = np.zeros(num_classes, dtype=np.int64)
-for i in train_idx:
-    train_counts += np.asarray(metas[i]["class_counts"], dtype=np.int64)
-_safe_counts   = np.maximum(train_counts, 1)
-_raw_weights   = 1.0 / np.sqrt(_safe_counts.astype(np.float64))
-class_weights_np = (_raw_weights / _raw_weights.mean()).astype(np.float32)
-log.info(f"Train class counts : {train_counts.tolist()}")
-log.info(f"Class weights      : [{', '.join(f'{w:.3f}' for w in class_weights_np)}]")
-
-
-def _run_dirname(args, class_weights):
-    w_str = "-".join(f"{w:.2f}" for w in class_weights)
-    return (f"lr{args.lr:.0e}_wd{args.weight_decay:.0e}_bs{args.batch_size}"
-            f"__cw{w_str}")
-
-
-CKPT_DIR = CKPT_ROOT / _run_dirname(args, class_weights_np.tolist())
-OLD_DIR  = CKPT_DIR / "old"
-
-test_set  = [graphs[i] for i in test_idx]
-val_set   = [graphs[i] for i in val_idx]
-train_set = [graphs[i] for i in train_idx]
-
-loader_generator = torch.Generator().manual_seed(args.seed)
-_pin = device.type == "cuda"
-train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
-                          generator=loader_generator, pin_memory=_pin)
-val_loader   = DataLoader(val_set,   batch_size=args.batch_size, pin_memory=_pin)
-test_loader  = DataLoader(test_set,  batch_size=args.batch_size, pin_memory=_pin)
-
-
-class GAT(torch.nn.Module):
-    """Multi-layer GAT with additive drone-signature fusion.
-
-    Each GATConv layer uses `num_heads` attention heads; outputs are averaged
-    (concat=False) to keep the hidden dimension constant across layers.
-    Residual connections + LayerNorm mirror the EdgeSAGE baseline.
-    """
-
-    def __init__(self, num_node_features, num_drone_features, hidden_channels,
-                 out_channels, dropout, num_layers, num_heads):
-        super().__init__()
-        self.node_proj  = torch.nn.Linear(num_node_features,  hidden_channels)
-        self.drone_proj = torch.nn.Linear(num_drone_features, hidden_channels)
-        self.convs = torch.nn.ModuleList([
-            GATConv(hidden_channels, hidden_channels,
-                    heads=num_heads, concat=False, dropout=ATTN_DROPOUT)
-            for _ in range(num_layers)
-        ])
-        self.norms = torch.nn.ModuleList(
-            [torch.nn.LayerNorm(hidden_channels) for _ in range(num_layers)]
-        )
-        self.output_proj = torch.nn.Linear(hidden_channels, out_channels)
-        self.dropout = dropout
-
-    def forward(self, x, edge_index, drone_feat, batch):
-        h = self.node_proj(x) + self.drone_proj(drone_feat)[batch]
-        for conv, norm in zip(self.convs, self.norms):
-            h = h + F.dropout(F.relu(norm(conv(h, edge_index))),
-                              p=self.dropout, training=self.training)
-        return self.output_proj(h)
-
-
-model = GAT(num_node_features, num_drone_features, args.hidden_channels,
-            num_classes, args.dropout, args.num_layers, args.num_heads).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=args.lr,
-                             weight_decay=args.weight_decay)
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-    optimizer, mode="max", factor=args.lr_factor,
-    patience=args.lr_patience, min_lr=args.lr_min,
-)
-
-_use_bf16 = device.type == "cuda" and torch.cuda.is_bf16_supported()
-amp_ctx = (
-    (lambda: torch.autocast(device_type="cuda", dtype=torch.bfloat16))
-    if _use_bf16 else contextlib.nullcontext
-)
-log.info(f"AMP bfloat16: {_use_bf16}")
-log.info(f"Batch size: {args.batch_size} × grad_accum {args.grad_accum_steps} "
-         f"= effective {args.batch_size * args.grad_accum_steps}")
-
-try:
-    model = torch.compile(model)
-    log.info("torch.compile: enabled")
-except Exception as e:
-    log.warning(f"torch.compile: disabled ({e})")
-
-class_weights = torch.tensor(class_weights_np, device=device)
-
-
-def weighted_ce_loss(logits, target):
-    return F.cross_entropy(logits, target, weight=class_weights, ignore_index=-1)
-
-
-def train_step(epoch: int | None = None):
-    model.train()
-    total_loss = total_nodes = 0
-    accum_steps = max(1, args.grad_accum_steps)
-    desc = f"train ep{epoch:03d}" if epoch is not None else "train"
-    pbar = tqdm(train_loader, desc=desc, leave=False, unit="batch",
-                dynamic_ncols=True)
-    optimizer.zero_grad(set_to_none=True)
-    n_batches = len(train_loader)
-    for step, batch in enumerate(pbar):
-        batch = batch.to(device, non_blocking=True)
-        with amp_ctx():
-            out  = model(batch.x, batch.edge_index, batch.drone_feat, batch.batch)
-            loss = weighted_ce_loss(out, batch.y)
-        (loss / accum_steps).backward()
-        total_loss  += float(loss) * batch.num_nodes
-        total_nodes += batch.num_nodes
-        is_step = (step + 1) % accum_steps == 0 or (step + 1) == n_batches
-        if is_step:
-            if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-        pbar.set_postfix(loss=f"{total_loss / max(total_nodes, 1):.4f}")
-    return total_loss / total_nodes
-
-
-@torch.no_grad()
-def evaluate(loader, desc: str = "eval"):
-    model.eval()
-    total_loss = total_nodes = 0
-    preds_all, targets_all = [], []
-    for batch in tqdm(loader, desc=desc, leave=False, unit="batch",
-                      dynamic_ncols=True):
-        batch = batch.to(device, non_blocking=True)
-        with amp_ctx():
-            out  = model(batch.x, batch.edge_index, batch.drone_feat, batch.batch)
-            loss = weighted_ce_loss(out, batch.y)
-        total_loss  += float(loss) * batch.num_nodes
-        total_nodes += batch.num_nodes
-        preds_all.append(out.argmax(dim=-1).cpu())
-        targets_all.append(batch.y.cpu())
-    preds   = torch.cat(preds_all).numpy()
-    targets = torch.cat(targets_all).numpy()
-    valid   = targets >= 0
-    preds, targets = preds[valid], targets[valid]
-    acc      = float((preds == targets).mean())
-    mcc      = float(matthews_corrcoef(targets, preds))
-    bal_acc  = float(balanced_accuracy_score(targets, preds))
-    macro_f1 = float(f1_score(targets, preds, average="macro", zero_division=0))
-    kappa    = float(cohen_kappa_score(targets, preds))
-    rare_labels = [c for c in (3, 4) if c < num_classes]
-    rare_rec = float(recall_score(
-        targets, preds, labels=rare_labels, average="macro", zero_division=0)) \
-        if rare_labels else 0.0
-    return (total_loss / total_nodes, acc, mcc, bal_acc, macro_f1, kappa,
-            rare_rec, preds, targets)
-
-
-def save_if_better(val_mcc, val_acc, test_mcc, test_acc, epoch, state, prev_mcc):
-    CKPT_DIR.mkdir(parents=True, exist_ok=True)
-    OLD_DIR.mkdir(parents=True, exist_ok=True)
-    if val_mcc <= prev_mcc + args.min_delta:
-        return False
-    for p in CKPT_DIR.glob("gat_*.pt"):
-        shutil.move(str(p), str(OLD_DIR / p.name))
-    name = (f"gat_epoch{epoch:03d}_mcc{val_mcc:.4f}_acc{val_acc:.4f}"
-            f"_testmcc{test_mcc:.4f}_testacc{test_acc:.4f}.pt")
-    torch.save(state, CKPT_DIR / name)
-    if args.keep_old_ckpts >= 0:
-        olds = sorted(OLD_DIR.glob("gat_*.pt"), key=lambda p: p.stat().st_mtime)
-        for p in olds[:-args.keep_old_ckpts] if args.keep_old_ckpts else olds:
-            p.unlink(missing_ok=True)
-    log.success(f"saved new best → {name} (prev MCC={prev_mcc:.4f})")
-    return True
-
-
-best_val_mcc = -2.0
-best_val_acc = 0.0
-test_mcc_at_best = 0.0
-test_acc_at_best = 0.0
-best_val_preds = best_val_targets = None
-best_ts_preds  = best_ts_targets  = None
-epochs_no_improve = 0
-best_epoch = 0
-times = []
-last_epoch = 0
-stop_reason = "completed"
-
-history = {
-    "epoch": [],
-    "train_loss": [], "val_loss": [], "test_loss": [],
-    "val_acc": [], "test_acc": [],
-    "val_mcc": [], "test_mcc": [],
-    "val_prec": [], "val_rec": [], "val_f1": [],
-    "test_prec": [], "test_rec": [], "test_f1": [],
-    "lr": [],
-}
-labels_list = list(range(num_classes))
-
-
-def _per_cls(arr):
-    return "  ".join(f"c{c}:{arr[c]:.3f}" for c in labels_list)
-
-
-epoch_bar = tqdm(range(1, args.epochs + 1), desc="epochs", unit="ep",
-                 dynamic_ncols=True)
-try:
-    for epoch in epoch_bar:
-        last_epoch = epoch
-        t0 = time.time()
-        tr_loss = train_step(epoch)
-
-        do_eval = (epoch % args.eval_every == 0
-                   or epoch == 1
-                   or epoch == args.epochs)
-        if not do_eval:
-            times.append(time.time() - t0)
-            epoch_bar.set_postfix(loss=f"{tr_loss:.4f}", eval="skip")
-            log.debug(f"Ep {epoch:03d} | loss {tr_loss:.4f} (eval skipped)")
-            continue
-
-        (val_loss, val_acc, val_mcc, val_bal, val_f1m, val_kap, val_rare,
-         val_preds, val_targets) = evaluate(val_loader,  desc=f"val ep{epoch:03d}")
-        (ts_loss,  ts_acc,  ts_mcc,  ts_bal,  ts_f1m,  ts_kap,  ts_rare,
-         ts_preds,  ts_targets)  = evaluate(test_loader, desc=f"test ep{epoch:03d}")
-
-        scheduler.step(val_mcc)
-        current_lr = optimizer.param_groups[0]["lr"]
-
-        improved = val_mcc > best_val_mcc + args.min_delta
-        if improved:
-            prev_best_mcc = best_val_mcc
-            best_val_mcc, best_val_acc = val_mcc, val_acc
-            test_mcc_at_best, test_acc_at_best = ts_mcc, ts_acc
-            best_val_preds, best_val_targets = val_preds, val_targets
-            best_ts_preds,  best_ts_targets  = ts_preds,  ts_targets
-            best_epoch = epoch
-            epochs_no_improve = 0
-            state_src = getattr(model, "_orig_mod", model)
-            save_if_better(val_mcc, val_acc, ts_mcc, ts_acc, epoch, {
-                "model_state": state_src.state_dict(),
-                "args": vars(args),
-                "epoch": epoch,
-                "val_mcc": val_mcc, "val_acc": val_acc,
-                "test_mcc": ts_mcc, "test_acc": ts_acc,
-                "num_node_features": num_node_features,
-                "num_drone_features": num_drone_features,
-                "num_classes": num_classes,
-                "class_weights": class_weights_np.tolist(),
-                "train_class_counts": train_counts.tolist(),
-                "test_maps": sorted(test_maps),
-                "val_maps": sorted(val_maps),
-            }, prev_best_mcc)
-        else:
-            epochs_no_improve += args.eval_every
-
-        v_p, v_r, v_f, _ = precision_recall_fscore_support(
-            val_targets, val_preds, labels=labels_list, zero_division=0)
-        t_p, t_r, t_f, _ = precision_recall_fscore_support(
-            ts_targets,  ts_preds,  labels=labels_list, zero_division=0)
-        history["epoch"].append(epoch)
-        history["train_loss"].append(tr_loss)
-        history["val_loss"].append(val_loss)
-        history["test_loss"].append(ts_loss)
-        history["val_acc"].append(val_acc)
-        history["test_acc"].append(ts_acc)
-        history["val_mcc"].append(val_mcc)
-        history["test_mcc"].append(ts_mcc)
-        history["val_prec"].append(v_p)
-        history["val_rec"].append(v_r)
-        history["val_f1"].append(v_f)
-        history["test_prec"].append(t_p)
-        history["test_rec"].append(t_r)
-        history["test_f1"].append(t_f)
-        history["lr"].append(current_lr)
-        times.append(time.time() - t0)
-
-        epoch_bar.set_postfix(loss=f"{tr_loss:.4f}", val_mcc=f"{val_mcc:.3f}",
-                              best=f"{best_val_mcc:.3f}",
-                              lr=f"{current_lr:.1e}",
-                              pat=f"{epochs_no_improve}/{args.patience}")
-        log.info(f"── Epoch {epoch:03d} ──  (loss {tr_loss:.4f} | lr {current_lr:.2e} | "
-                 f"pat {epochs_no_improve}/{args.patience})")
-        log.info(f"  VAL    | acc {val_acc:.3f} | mcc {val_mcc:.3f} | "
-                 f"bal {val_bal:.3f} | f1m {val_f1m:.3f} | "
-                 f"kap {val_kap:.3f} | rareRec {val_rare:.3f}")
-        log.info(f"    ├─ precision  {_per_cls(v_p)}")
-        log.info(f"    ├─ recall     {_per_cls(v_r)}")
-        log.info(f"    └─ f1         {_per_cls(v_f)}")
-        log.info(f"  TEST   | acc {ts_acc:.3f} | mcc {ts_mcc:.3f} | "
-                 f"bal {ts_bal:.3f} | f1m {ts_f1m:.3f} | "
-                 f"kap {ts_kap:.3f} | rareRec {ts_rare:.3f}")
-        log.info(f"    ├─ precision  {_per_cls(t_p)}")
-        log.info(f"    ├─ recall     {_per_cls(t_r)}")
-        log.info(f"    └─ f1         {_per_cls(t_f)}")
-        if epochs_no_improve >= args.patience:
-            stop_reason = "early_stopping"
-            log.warning(f"Early stopping at epoch {epoch} "
-                        f"(no improvement for {args.patience} epochs, "
-                        f"best epoch {best_epoch})")
-            break
-    else:
-        stop_reason = "max_epochs"
-except KeyboardInterrupt:
-    stop_reason = "manual_interrupt"
-    log.warning("Interrupted by user.")
-finally:
-    epoch_bar.close()
 
 
 def _fmt_time(seconds: float) -> str:
@@ -427,119 +173,313 @@ def _fmt_time(seconds: float) -> str:
     return f"{h:d}h{m:02d}m{s:02d}s" if h else f"{m:d}m{s:02d}s"
 
 
-reason_label = {
-    "completed":         "Training completed (all epochs)",
-    "max_epochs":        "Training completed (all epochs)",
-    "early_stopping":    "Training stopped early (patience exhausted)",
-    "manual_interrupt":  "Training stopped manually (KeyboardInterrupt)",
-}[stop_reason]
+def _build_model(args, env, log):
+    base_model = GAT(
+        num_node_features  = NUM_FEATURES,
+        num_drone_features = DRONE_FEAT_DIM,
+        hidden_channels    = args.hidden_channels,
+        out_channels       = NUM_CLASSES,
+        dropout            = args.dropout,
+        attn_dropout       = ATTN_DROPOUT,
+        num_layers         = args.num_layers,
+        num_heads          = args.num_heads,
+        grad_checkpoint    = args.grad_checkpoint,
+    ).to(env.device)
+    log.info(f"Activation checkpointing: {args.grad_checkpoint}")
 
-total_time  = sum(times)
-median_time = float(torch.tensor(times).median()) if times else 0.0
-mean_time   = float(torch.tensor(times).mean())   if times else 0.0
+    if env.is_distributed:
+        ddp_model = DDP(base_model, device_ids=[env.local_rank],
+                        output_device=env.local_rank)
+    else:
+        ddp_model = base_model
 
-log.success("=" * 70)
-log.success(f"  TRAINING SUMMARY — {reason_label}")
-log.success("=" * 70)
-log.info(f"  Epochs run         : {last_epoch}/{args.epochs}")
-log.info(f"  Best epoch         : {best_epoch}")
-log.info(f"  Best val   MCC/Acc : {best_val_mcc:.4f} / {best_val_acc:.4f}")
-log.info(f"  Test @ best MCC/Acc: {test_mcc_at_best:.4f} / {test_acc_at_best:.4f}")
-log.info(f"  Total time         : {_fmt_time(total_time)}")
-log.info(f"  Mean/median epoch  : {mean_time:.2f}s / {median_time:.2f}s")
-log.info(f"  Checkpoint dir     : {CKPT_DIR}")
-log.success("=" * 70)
+    if not args.compile:
+        log.info("torch.compile: disabled (--no-compile)")
+        return ddp_model, ddp_model
+
+    try:
+        model = torch.compile(ddp_model)
+        log.info("torch.compile: enabled")
+    except Exception as e:
+        log.warning(f"torch.compile: disabled ({e})")
+        model = ddp_model
+    return model, ddp_model
 
 
-def _per_class_report(name, preds, targets):
-    if preds is None or len(preds) == 0:
-        log.warning(f"[{name}] no predictions recorded.")
-        return
-    labels = list(range(num_classes))
-    class_names = [f"class {c}" for c in labels]
-    prec, rec, f1, sup = precision_recall_fscore_support(
-        targets, preds, labels=labels, zero_division=0
+def _build_state_for_save(model, args, epoch, val_score, val_acc, val_metrics,
+                          track_metric_spec, class_weights_np, train_counts,
+                          test_maps, val_maps):
+    return {
+        "model_state":         unwrap_module(model).state_dict(),
+        "args":                vars(args),
+        "epoch":               epoch,
+        "val_score":           val_score,
+        "val_acc":             val_acc,
+        "val_metrics":         val_metrics,
+        "track_metric":        track_metric_spec,
+        # kept for backwards-compat with existing tooling
+        "val_bal_acc":         val_metrics.get("bal", 0.0),
+        "num_node_features":   NUM_FEATURES,
+        "num_drone_features":  DRONE_FEAT_DIM,
+        "num_classes":         NUM_CLASSES,
+        "class_weights":       class_weights_np.tolist(),
+        "train_class_counts":  train_counts.tolist(),
+        "test_maps":           sorted(test_maps),
+        "val_maps":            sorted(val_maps),
+    }
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+
+    env = init_distributed()
+    is_tty = sys.stdout.isatty()
+    show_pbar = env.is_main and is_tty
+    log = rank_aware_logger(get_logger("gat.train"), env)
+
+    _seed_everything(args.seed)
+    log.info(f"Seed: {args.seed} | rank {env.rank}/{env.world_size} | "
+             f"distributed={env.is_distributed}")
+    log.info(f"Using device: {env.device}")
+
+    # ── Dataset / split / class weights ───────────────────────────────────────
+    log.info(f"Loading sharded dataset from {SHARD_DIR}")
+    graphs, metas = load_dataset()
+    log.info(f"Loaded {len(graphs)} graphs | node_feat={NUM_FEATURES} "
+             f"drone_feat={DRONE_FEAT_DIM} | classes={NUM_CLASSES}")
+
+    split = map_level_split(metas, args.val_ratio, args.test_ratio, args.split_seed)
+    train_maps, train_idx = split["train"]
+    val_maps,   val_idx   = split["val"]
+    test_maps,  test_idx  = split["test"]
+    log.info(f"Split | train={len(train_maps)} cities ({len(train_idx)} graphs) "
+             f"| val={len(val_idx)} graphs (held-out from train cities) "
+             f"| test={len(test_maps)} cities ({len(test_idx)} graphs)")
+    log.info(f"  test cities : {', '.join(sorted(test_maps))}")
+    if test_idx:
+        test_z = np.array([metas[i]["z"] for i in test_idx])
+        h, edges = np.histogram(test_z, bins=8)
+        bars = " ".join(f"[{a:.1f}-{b:.1f}):{c}"
+                        for a, b, c in zip(edges[:-1], edges[1:], h))
+        log.info(f"  test Z dist : {bars}")
+
+    train_counts, class_weights_np, is_manual = compute_class_weights(
+        metas, train_idx, NUM_CLASSES)
+    log.info(f"Train class counts : {train_counts.tolist()}")
+    log.info(f"Class weights      : [{', '.join(f'{w:.3f}' for w in class_weights_np)}]"
+             f" ({'manual' if is_manual else 'auto'})")
+
+    train_loader, val_loader, test_loader, train_sampler = build_loaders(
+        graphs, split, args.batch_size, env, args.seed)
+
+    ckpt_dir = CKPT_ROOT / run_dirname(args, class_weights_np.tolist())
+    old_dir  = ckpt_dir / "old"
+
+    # ── Run directory (timestamped) — holds config dump + final plots ─────────
+    if env.is_main:
+        run_dir, run_stamp = make_run_dir(PLOTS_DIR)
+        save_training_config(
+            run_dir, args, class_weights_np, train_counts,
+            train_maps, val_maps, test_maps,
+            args.track_metric, env, log,
+        )
+        log.info(f"Run dir            : {run_dir}")
+    else:
+        run_dir = None
+
+    # ── Model / optimizer / trainer ───────────────────────────────────────────
+    model, ddp_model = _build_model(args, env, log)
+    optimizer = torch.optim.Adam(ddp_model.parameters(), lr=args.lr,
+                                 weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=args.lr_factor,
+        patience=args.lr_patience, min_lr=args.lr_min,
     )
-    acc = float((preds == targets).mean())
-    log.info(f"[{name}] per-class metrics (accuracy={acc:.4f})")
-    log.info(f"  {'class':<10}{'precision':>11}{'recall':>11}{'f1':>11}{'support':>11}")
-    for c, p, r, f, s in zip(class_names, prec, rec, f1, sup):
-        log.info(f"  {c:<10}{p:>11.4f}{r:>11.4f}{f:>11.4f}{int(s):>11d}")
-    macro    = precision_recall_fscore_support(
-        targets, preds, labels=labels, average="macro",    zero_division=0)
-    weighted = precision_recall_fscore_support(
-        targets, preds, labels=labels, average="weighted", zero_division=0)
-    log.info(f"  {'macro avg':<10}{macro[0]:>11.4f}{macro[1]:>11.4f}{macro[2]:>11.4f}"
-             f"{int(sup.sum()):>11d}")
-    log.info(f"  {'weighted':<10}{weighted[0]:>11.4f}{weighted[1]:>11.4f}{weighted[2]:>11.4f}"
-             f"{int(sup.sum()):>11d}")
-    cm = confusion_matrix(targets, preds, labels=labels)
-    log.info("  confusion matrix (rows=true, cols=pred):")
-    log.info("       " + "".join(f"{c:>8}" for c in labels))
-    for i, row in enumerate(cm):
-        log.info(f"  {i:>4} " + "".join(f"{v:>8d}" for v in row))
+
+    class_weights = torch.tensor(class_weights_np, device=env.device)
+    trainer = Trainer(model, ddp_model, optimizer, class_weights,
+                      env, args, log, show_pbar=show_pbar)
+    log.info(f"AMP bfloat16: {trainer.use_bf16}")
+    log.info(f"Batch size: {args.batch_size} × grad_accum {args.grad_accum_steps} "
+             f"× world_size {env.world_size} = effective "
+             f"{args.batch_size * args.grad_accum_steps * env.world_size}")
+
+    # ── Training loop ─────────────────────────────────────────────────────────
+    tracked_metrics = _parse_track_metric(args.track_metric)
+    track_label     = "+".join(n for n, _ in tracked_metrics)
+    log.info(f"Tracking metric: {track_label} "
+             f"(mean of {len(tracked_metrics)} — drives best-ckpt, "
+             f"early-stop, LR scheduler)")
+
+    best_val_score, best_val_acc = -1.0, 0.0
+    best_val_preds = best_val_targets = None
+    best_epoch = 0
+    times: list[float] = []
+    last_epoch = 0
+    stop_reason = "completed"
+
+    history = {
+        "epoch": [], "train_loss": [], "val_loss": [],
+        "val_acc": [], "val_bal": [], "val_score": [],
+        "val_f1m": [], "val_mcc": [],
+        "val_prec": [], "val_rec": [], "val_f1": [], "lr": [],
+    }
+    labels_list = list(range(NUM_CLASSES))
+
+    def per_cls(arr):
+        return "  ".join(f"c{c}:{arr[c]:.3f}" for c in labels_list)
+
+    epoch_bar = tqdm(range(1, args.epochs + 1), desc="epochs", unit="ep",
+                     ncols=0, ascii=True, disable=not show_pbar)
+
+    try:
+        for epoch in epoch_bar:
+            last_epoch = epoch
+            t0 = time.time()
+            tr_loss = trainer.train_step(train_loader, train_sampler, epoch)
+
+            do_eval = (epoch % args.eval_every == 0
+                       or epoch == 1 or epoch == args.epochs)
+            if not do_eval:
+                times.append(time.time() - t0)
+                epoch_bar.set_postfix(loss=f"{tr_loss:.4f}", eval="skip")
+                log.debug(f"Ep {epoch:03d} | loss {tr_loss:.4f} (eval skipped)")
+                continue
+
+            # Eval / saving happen on rank 0 only — others wait at the broadcast.
+            val_score_local = 0.0
+            should_stop_local = False
+            if env.is_main:
+                (val_loss, val_acc, val_mcc, val_bal, val_f1m, val_kap, val_rare,
+                 val_preds, val_targets) = trainer.evaluate(
+                    val_loader, NUM_CLASSES, desc=f"val ep{epoch:03d}")
+                eval_tuple = (val_loss, val_acc, val_mcc, val_bal, val_f1m,
+                              val_kap, val_rare)
+                per_metric = [float(eval_tuple[i]) for _, i in tracked_metrics]
+                val_score = float(np.mean(per_metric))
+                val_metrics_dict = {
+                    "acc": val_acc, "mcc": val_mcc, "bal": val_bal,
+                    "f1m": val_f1m, "kap": val_kap, "rare": val_rare,
+                }
+                current_lr = optimizer.param_groups[0]["lr"]
+
+                if val_score > best_val_score + args.min_delta:
+                    prev_best_score = best_val_score
+                    best_val_score, best_val_acc = val_score, val_acc
+                    best_val_preds, best_val_targets = val_preds, val_targets
+                    best_epoch = epoch
+                    save_checkpoint(
+                        ckpt_dir, old_dir, val_score, val_acc, epoch,
+                        _build_state_for_save(model, args, epoch, val_score,
+                                              val_acc, val_metrics_dict,
+                                              args.track_metric,
+                                              class_weights_np, train_counts,
+                                              test_maps, val_maps),
+                        prev_best_score, args.min_delta, args.keep_old_ckpts, log)
+
+                epochs_no_improve = epoch - best_epoch
+                v_p, v_r, v_f, _ = precision_recall_fscore_support(
+                    val_targets, val_preds, labels=labels_list, zero_division=0)
+                history["epoch"].append(epoch)
+                history["train_loss"].append(tr_loss)
+                history["val_loss"].append(val_loss)
+                history["val_acc"].append(val_acc)
+                history["val_bal"].append(val_bal)
+                history["val_score"].append(val_score)
+                history["val_f1m"].append(val_f1m)
+                history["val_mcc"].append(val_mcc)
+                history["val_prec"].append(v_p)
+                history["val_rec"].append(v_r)
+                history["val_f1"].append(v_f)
+                history["lr"].append(current_lr)
+                times.append(time.time() - t0)
+
+                breakdown = " ".join(f"{n}={v:.3f}"
+                                     for (n, _), v in zip(tracked_metrics, per_metric))
+                epoch_bar.set_postfix(loss=f"{tr_loss:.4f}",
+                                      score=f"{val_score:.3f}",
+                                      best=f"{best_val_score:.3f}",
+                                      lr=f"{current_lr:.1e}",
+                                      pat=f"{epochs_no_improve}/{args.patience}")
+                log.info(f"── Epoch {epoch:03d} ──  (loss {tr_loss:.4f} | lr {current_lr:.2e} | "
+                         f"pat {epochs_no_improve}/{args.patience})")
+                log.info(f"  VAL    | acc {val_acc:.3f} | bal {val_bal:.3f} | "
+                         f"mcc {val_mcc:.3f} | f1m {val_f1m:.3f} | "
+                         f"kap {val_kap:.3f} | rareRec {val_rare:.3f}")
+                log.info(f"  TRACK  | {track_label}={val_score:.4f} [{breakdown}] | "
+                         f"best={best_val_score:.4f} (ep{best_epoch})")
+                log.info(f"    ├─ precision  {per_cls(v_p)}")
+                log.info(f"    ├─ recall     {per_cls(v_r)}")
+                log.info(f"    └─ f1         {per_cls(v_f)}")
+
+                should_stop_local = epochs_no_improve >= args.patience
+                val_score_local = val_score
+            else:
+                times.append(time.time() - t0)
+
+            # Sync the LR-scheduler signal and the early-stopping flag across
+            # ranks so optimizer state stays identical and all ranks break together.
+            val_score_sync, should_stop = broadcast_decision(
+                val_score_local, should_stop_local, env)
+            scheduler.step(val_score_sync)
+
+            if should_stop:
+                stop_reason = "early_stopping"
+                log.warning(f"Early stopping at epoch {epoch} "
+                            f"(no improvement for {args.patience} epochs, "
+                            f"best epoch {best_epoch})")
+                break
+        else:
+            stop_reason = "max_epochs"
+    except KeyboardInterrupt:
+        stop_reason = "manual_interrupt"
+        log.warning("Interrupted by user.")
+    finally:
+        epoch_bar.close()
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    total_time  = sum(times)
+    median_time = float(torch.tensor(times).median()) if times else 0.0
+    mean_time   = float(torch.tensor(times).mean())   if times else 0.0
+
+    log.success("=" * 70)
+    log.success(f"  TRAINING SUMMARY — {_STOP_LABEL[stop_reason]}")
+    log.success("=" * 70)
+    log.info(f"  Epochs run         : {last_epoch}/{args.epochs}")
+    log.info(f"  Best epoch         : {best_epoch}")
+    log.info(f"  Tracked metric     : {track_label}")
+    log.info(f"  Best val score/Acc : {best_val_score:.4f} / {best_val_acc:.4f}")
+    log.info(f"  Total time         : {_fmt_time(total_time)}")
+    log.info(f"  Mean/median epoch  : {mean_time:.2f}s / {median_time:.2f}s")
+    log.info(f"  Checkpoint dir     : {ckpt_dir}")
+    log.success("=" * 70)
+
+    # ── Final test on rank 0 ──────────────────────────────────────────────────
+    if env.is_main:
+        per_class_report("VAL  @ best epoch", best_val_preds, best_val_targets,
+                         NUM_CLASSES, log)
+
+        ckpt_files = sorted(ckpt_dir.glob("gat_*.pt"))
+        if ckpt_files:
+            best_ckpt = torch.load(ckpt_files[-1], weights_only=False)
+            unwrap_module(model).load_state_dict(best_ckpt["model_state"])
+            log.info(f"Loaded best checkpoint for final test: {ckpt_files[-1].name}")
+        else:
+            log.warning("No checkpoint found — evaluating test with last model weights")
+        (ts_loss, ts_acc, ts_mcc, ts_bal, ts_f1m, ts_kap, ts_rare,
+         ts_preds, ts_targets) = trainer.evaluate(
+            test_loader, NUM_CLASSES, desc="final test")
+        log.success(f"  FINAL TEST | acc {ts_acc:.3f} | mcc {ts_mcc:.3f} | "
+                    f"bal {ts_bal:.3f} | f1m {ts_f1m:.3f} | "
+                    f"kap {ts_kap:.3f} | rareRec {ts_rare:.3f}")
+        per_class_report("TEST (final, best ckpt)", ts_preds, ts_targets,
+                         NUM_CLASSES, log)
+
+        save_history_plots(history, best_epoch, run_dir, log)
+        finalize_run_artifacts(run_dir, ckpt_dir, log)
+
+    teardown_distributed(env)
 
 
-_per_class_report("VAL  @ best epoch", best_val_preds, best_val_targets)
-_per_class_report("TEST @ best epoch", best_ts_preds,  best_ts_targets)
-
-
-def _save_history_plots(hist, best_epoch, out_dir):
-    if not hist["epoch"]:
-        log.warning("No epoch history recorded, skipping plots.")
-        return
-    out_dir.mkdir(parents=True, exist_ok=True)
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    ep = np.array(hist["epoch"])
-
-    fig, axes = plt.subplots(3, 3, figsize=(18, 15))
-
-    for ax, key, title in zip(
-        axes[0], ["loss", "acc", "mcc"], ["Loss", "Accuracy", "MCC"]
-    ):
-        if key == "loss":
-            ax.plot(ep, hist["train_loss"], label="train")
-        ax.plot(ep, hist[f"val_{key}"],  label="val")
-        ax.plot(ep, hist[f"test_{key}"], label="test")
-        if best_epoch:
-            ax.axvline(best_epoch, color="red", linestyle="--",
-                       alpha=0.5, label=f"best ep {best_epoch}")
-        ax.set_xlabel("Epoch"); ax.set_ylabel(title)
-        ax.set_title(f"{title} per epoch"); ax.grid(alpha=0.3); ax.legend()
-
-    for row, split in enumerate(("val", "test"), start=1):
-        prec = np.array(hist[f"{split}_prec"])
-        rec  = np.array(hist[f"{split}_rec"])
-        f1   = np.array(hist[f"{split}_f1"])
-        for ax, arr, title in zip(
-            axes[row], [prec, rec, f1], ["Precision", "Recall", "F1"]
-        ):
-            for c in range(arr.shape[1]):
-                ax.plot(ep, arr[:, c], label=f"class {c}")
-            if best_epoch:
-                ax.axvline(best_epoch, color="red", linestyle="--", alpha=0.5)
-            ax.set_xlabel("Epoch"); ax.set_ylabel(title)
-            ax.set_title(f"{split.upper()} — {title} per class")
-            ax.set_ylim(-0.02, 1.02); ax.grid(alpha=0.3); ax.legend(fontsize=8)
-
-    fig.tight_layout()
-    p = out_dir / f"metrics_{stamp}.png"
-    fig.savefig(p, dpi=120); plt.close(fig)
-    log.success(f"saved {p}")
-
-    if hist.get("lr"):
-        fig, ax = plt.subplots(figsize=(8, 4))
-        ax.plot(ep, hist["lr"])
-        if best_epoch:
-            ax.axvline(best_epoch, color="red", linestyle="--",
-                       alpha=0.5, label=f"best ep {best_epoch}")
-            ax.legend()
-        ax.set_xlabel("Epoch"); ax.set_ylabel("Learning rate")
-        ax.set_yscale("log"); ax.set_title("Learning-rate schedule")
-        ax.grid(alpha=0.3); fig.tight_layout()
-        p = out_dir / f"lr_{stamp}.png"
-        fig.savefig(p, dpi=120); plt.close(fig)
-        log.success(f"saved {p}")
-
-
-_save_history_plots(history, best_epoch, PLOTS_DIR)
+if __name__ == "__main__":
+    main()

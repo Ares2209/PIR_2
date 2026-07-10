@@ -3,10 +3,11 @@ noise-map PLY for a given drone and source position.
 
 Usage:
     python models/GAT/infer.py --drone M2 --x 1.2 --y -3.4 --z 0.5
-    python models/GAT/infer.py --drone F-4 --x 4 --y 4 --z 4 --ckpt /home/ldena/Bureau/PIR/models/GAT/checkpoints/lr5e-04_wd5e-05_bs4__cw0.20-0.17-0.33-0.61-1.46-4.09-0.14/gat_epoch045_mcc0.5626_acc0.6847_testmcc0.5509_testacc0.6788.pt
+    python3 models/GAT/infer.py --drone F-4 --x 4 --y 4 --z 4 --ckpt /home/ldena/Bureau/PIR-local/PIR/models/GAT/checkpoints/lr5e-04_wd5e-06_bs4__cw0.21-0.06-0.21-0.59-1.13-4.75-0.05/gat_epoch070_score0.7592_acc0.7778.pt
 """
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -14,30 +15,24 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
-from torch_geometric.nn import GATConv
 
 ROOT    = Path(__file__).resolve().parents[2]
 GAT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(GAT_DIR))
 
-# Tout vient de config.py — gen_graphs.py n'exporte pas de fonctions publiques
-from config import (  # noqa: E402
-    DRONES, NUM_FEATURES, DRONE_FEAT_DIM, RGB_TO_CLASS,
-    _parse_ply, _face_adjacency, _normalize_drone_vector,
-    _load_base_mesh, _OCC_CHUNK,
+from config import DRONES, NUM_FEATURES, DRONE_FEAT_DIM, RGB_TO_CLASS, FEAT_KEYS, NODE_STATS  # noqa: E402
+from core import GAT, get_logger  # noqa: E402
+from dataio import (  # noqa: E402
+    _build_node_features,
+    _face_adjacency,
+    _normalize_drone_vector,
+    _parse_ply,
 )
-from log_utils import get_logger  # noqa: E402
-
-# Import de la construction des features (définie dans gen_graphs)
-sys.path.insert(0, str(ROOT / "dataset" / "data" / "generated"))
-from gen_graphs import _build_node_features, _compute_occlusion  # noqa: E402
 
 log = get_logger("gat.infer")
 
 VILLE_PLY    = ROOT / "dataset" / "blender" / "ville.ply"
 CKPT_DIR     = GAT_DIR / "checkpoints"
-OUT_DIR      = GAT_DIR / "predictions"
 NOISEMAP_DIR = ROOT / "NoiseMap-RT-main"
 NOISEMAP_BIN = NOISEMAP_DIR / "build" / "NoiseMap"
 
@@ -53,34 +48,6 @@ CLASS_TO_RGB = np.array([
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Model — must mirror GAT.py exactly
-# ─────────────────────────────────────────────────────────────────────────────
-class GAT(torch.nn.Module):
-    def __init__(self, num_node_features, num_drone_features, hidden_channels,
-                 out_channels, dropout, attn_dropout, num_layers, num_heads):
-        super().__init__()
-        self.node_proj  = torch.nn.Linear(num_node_features,  hidden_channels)
-        self.drone_proj = torch.nn.Linear(num_drone_features, hidden_channels)
-        self.convs = torch.nn.ModuleList([
-            GATConv(hidden_channels, hidden_channels,
-                    heads=num_heads, concat=False, dropout=attn_dropout)
-            for _ in range(num_layers)
-        ])
-        self.norms = torch.nn.ModuleList([
-            torch.nn.LayerNorm(hidden_channels) for _ in range(num_layers)
-        ])
-        self.output_proj = torch.nn.Linear(hidden_channels, out_channels)
-        self.dropout     = dropout
-
-    def forward(self, x, edge_index, drone_feat, batch):
-        h = self.node_proj(x) + self.drone_proj(drone_feat)[batch]
-        for conv, norm in zip(self.convs, self.norms):
-            h = h + F.dropout(F.relu(norm(conv(h, edge_index))),
-                              p=self.dropout, training=self.training)
-        return self.output_proj(h)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def rgb_to_class_exact(rgb: np.ndarray) -> np.ndarray:
@@ -91,15 +58,20 @@ def rgb_to_class_exact(rgb: np.ndarray) -> np.ndarray:
 
 
 def pick_best_ckpt():
-    best, best_mcc = None, -2.0
-    for p in CKPT_DIR.rglob("gat_*.pt"):
-        if "old" in p.parts:
-            continue
-        m = re.search(r"mcc([-+]?\d*\.\d+)", p.name)
-        if m and float(m.group(1)) > best_mcc:
-            best_mcc = float(m.group(1))
-            best = p
-    return best
+    """Pick the best checkpoint by filename tag. Tries 'score' (current
+    naming), then 'bal' (older), then 'mcc' (legacy)."""
+    candidates = [p for p in CKPT_DIR.rglob("gat_*.pt") if "old" not in p.parts]
+    if not candidates:
+        return None
+    for tag in ("score", "bal", "mcc"):
+        tagged = []
+        for p in candidates:
+            m = re.search(rf"{tag}([-+]?\d*\.\d+)", p.name)
+            if m:
+                tagged.append((float(m.group(1)), p))
+        if tagged:
+            return max(tagged, key=lambda t: t[0])[1]
+    return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
 def write_ply_face_colors(path, verts, faces, face_rgb):
@@ -126,30 +98,27 @@ def run_noisemap(ville_path: Path, drone, x, y, z) -> Path:
     cmd = [str(NOISEMAP_BIN), str(ville_abs),
            str(x), str(y), str(z), "--drone", drone]
     log.info(f"Running ground-truth NoiseMap: {' '.join(cmd)}")
+    env = {**os.environ}
+    # Ensure the CUDA runtime library is findable by the NoiseMap binary.
+    cuda_lib = "/usr/local/cuda/lib64"
+    env["LD_LIBRARY_PATH"] = cuda_lib + ":" + env.get("LD_LIBRARY_PATH", "")
     subprocess.run(cmd, cwd=NOISEMAP_BIN.parent, check=True,
-                   stdout=subprocess.DEVNULL)
+                   stdout=subprocess.DEVNULL, env=env)
     return ville_abs.with_name(ville_abs.stem + "_noisemap.ply")
 
 
 def _load_and_normalize_stats(ckpt: dict) -> tuple[np.ndarray, np.ndarray] | None:
-    """Charge mean/std depuis le checkpoint si disponible."""
+    """Charge mean/std depuis le checkpoint si disponible, sinon depuis
+    NODE_STATS (qui combine node_stats.json + valeurs par défaut pour les
+    clés absentes du JSON — même logique que `dataio._normalize_node_features`)."""
     mean = ckpt.get("node_mean")
     std  = ckpt.get("node_std")
     if mean is not None and std is not None:
         return np.array(mean, dtype=np.float32), np.array(std, dtype=np.float32)
-    # Fallback : node_stats.json à côté des shards
-    stats_path = ROOT / "dataset" / "data" / "generated" / "processed" / "node_stats.json"
-    if stats_path.exists():
-        import json
-        with stats_path.open() as f:
-            stats = json.load(f)
-        from config import FEAT_KEYS
-        mean = np.array([stats[k][0] for k in FEAT_KEYS], dtype=np.float32)
-        std  = np.array([stats[k][1] for k in FEAT_KEYS], dtype=np.float32)
-        log.info(f"Loaded normalisation stats from {stats_path}")
-        return mean, std
-    log.warning("No normalisation stats found — features will NOT be normalised.")
-    return None
+    mean = np.array([NODE_STATS[k][0] for k in FEAT_KEYS], dtype=np.float32)
+    std  = np.array([NODE_STATS[k][1] for k in FEAT_KEYS], dtype=np.float32)
+    log.info("Loaded normalisation stats from config.NODE_STATS")
+    return mean, std
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -174,6 +143,19 @@ def main():
         raise FileNotFoundError(f"No checkpoint found in {CKPT_DIR}")
     log.info(f"Loading checkpoint: {ckpt_path.name}")
     ckpt = torch.load(ckpt_path, weights_only=False, map_location="cpu")
+
+    ckpt_feat_dim = int(ckpt.get("num_node_features", -1))
+    if ckpt_feat_dim != NUM_FEATURES:
+        log.error(
+            f"Checkpoint was trained with {ckpt_feat_dim} node features but "
+            f"the current code emits {NUM_FEATURES} (FEAT_KEYS changed). The "
+            f"checkpoint is incompatible — its first projection layer expects "
+            f"a different input width.\n"
+            f"  Fix: retrain after rebuilding shards (`gen_graphs.py "
+            f"--no-resume`), or point --ckpt at a checkpoint that matches the "
+            f"current FEAT_KEYS."
+        )
+        sys.exit(2)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info(f"Using device: {device}")
@@ -232,11 +214,14 @@ def main():
     log.info(f"Class distribution (pred): {counts.tolist()}")
 
     # ── Écriture PLY prédiction ───────────────────────────────────────────────
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    # Predictions live next to the checkpoint they came from, so each ckpt
+    # owns its own gallery: <ckpt_dir>/predictions/<ckpt_stem>/...
+    out_dir = ckpt_path.parent / "predictions" / ckpt_path.stem
+    out_dir.mkdir(parents=True, exist_ok=True)
     out_name = args.out or (
         f"NoiseMap_{args.x:.4f}_{args.y:.4f}_{args.z:.4f}_{args.drone}_pred.ply"
     )
-    out_path = OUT_DIR / out_name
+    out_path = out_dir / out_name
     write_ply_face_colors(out_path, verts, faces, rgb_out)
     log.success(f"Written: {out_path}")
 
@@ -297,11 +282,11 @@ def main():
             log.info("  " + " ".join(f"{v:6d}" for v in row))
 
     gt_rgb_out = CLASS_TO_RGB[np.where(valid, gt_cls, 0)]
-    gt_path    = OUT_DIR / out_name.replace("_pred.ply", "_gt.ply")
+    gt_path    = out_dir / out_name.replace("_pred.ply", "_gt.ply")
     write_ply_face_colors(gt_path, verts, faces, gt_rgb_out)
     log.success(f"Written GT: {gt_path}")
 
-    plot_path = OUT_DIR / out_name.replace("_pred.ply", "_plots.png")
+    plot_path = out_dir / out_name.replace("_pred.ply", "_plots.png")
     make_plots(centroids, cls, gt_cls, counts, gt_counts, cm, per_cls,
                acc, mcc, args, plot_path)
     log.success(f"Written plots: {plot_path}")

@@ -1,4 +1,9 @@
-"""Hyperparameters for the GAT model. Edit values here to tune training."""
+"""Hyperparameters and canonical constants for the GAT pipeline.
+
+This file is import-side-effect-light: it defines constants only. PLY parsing,
+feature normalisation, dataset loading and other helpers live in `dataio.py`;
+training plumbing lives in `core.py`.
+"""
 
 from __future__ import annotations
 
@@ -6,20 +11,23 @@ import json
 import re
 import warnings
 from pathlib import Path
-from typing import Optional
 
-import numpy as np
 
+# ─────────────────────────────────────────────────────────────────────────────
 # Model architecture
-HIDDEN_CHANNELS = 64
-NUM_LAYERS      = 3
-NUM_HEADS       = 4          
-ATTN_DROPOUT    = 0.2        
-DROPOUT         = 0.2       
+# ─────────────────────────────────────────────────────────────────────────────
+HIDDEN_CHANNELS = 128
+NUM_LAYERS      = 6
+NUM_HEADS       = 5
+ATTN_DROPOUT    = 0.2858666834614854
+DROPOUT         = 0.2
 
-LR               = 5e-4
-WEIGHT_DECAY     = 5e-5
-EPOCHS           = 300
+# ─────────────────────────────────────────────────────────────────────────────
+# Optimization
+# ─────────────────────────────────────────────────────────────────────────────
+LR               = 0.0005407835674001513
+WEIGHT_DECAY     = 5.024783335894379e-06
+EPOCHS           = 600
 BATCH_SIZE       = 4
 GRAD_CLIP        = 1.0
 GRAD_ACCUM_STEPS = 4
@@ -28,6 +36,21 @@ VAL_RATIO  = 0.15
 TEST_RATIO = 0.15
 SPLIT_SEED = 0
 SEED       = 42
+
+# ── Evaluation split ─────────────────────────────────────────────────────────
+# The final test runs on whole cities the model never saw during training
+# (true geometric generalisation). With 10 cities → 7 train / 3 test by default.
+# Validation (early-stopping / LR scheduler) is carved out graph-level from the
+# train cities, so the 7 train cities all keep contributing and the test cities
+# stay completely clean.
+N_TEST_CITIES = 3
+# The drone-source altitude Z is extremely skewed (most points sit in [0.2, 1.3]).
+# An unbalanced test would mostly report low-altitude performance. We subsample
+# the test graphs into fixed-width Z bins and cap each bin so the test set has a
+# roughly uniform altitude distribution — every Z range weighs ~equally.
+EVAL_Z_BALANCE = True
+EVAL_Z_BINS    = 8        # number of fixed-width Z bins over the test Z range
+EVAL_Z_PER_BIN = 40     # max graphs per bin; None → median non-empty bin size
 
 EVAL_EVERY  = 5
 PATIENCE    = 50
@@ -39,8 +62,12 @@ LR_MIN      = 1e-6
 
 KEEP_OLD_CHECKPOINTS = 3
 
+# Per-class CE weights (violet, blue, yellow, orange, red, dark_red, occluded).
+# Set to None to use auto-computed inverse-sqrt weights.
+CLASS_WEIGHTS = [0.6581047128250365, 0.3402403449139341, 0.20343783507673832, 1.5696092757007185, 4.048243580680749, 5.7084092327128335, 0.6898965029646703]
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Chemins
+# Paths
 # ─────────────────────────────────────────────────────────────────────────────
 SCRIPT_DIR  = Path(__file__).resolve().parent
 REPO_ROOT   = SCRIPT_DIR.parents[1]
@@ -48,11 +75,10 @@ GENERATED   = REPO_ROOT / "dataset" / "data" / "generated"
 OUT_DIR     = GENERATED / "processed"
 SHARD_DIR   = OUT_DIR / "shards"
 STATS_FILE  = OUT_DIR / "node_stats.json"
-BLENDER_DIR = REPO_ROOT / "dataset" / "blender"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Drones — signatures acoustiques
+# Drones — acoustic signatures
 # ─────────────────────────────────────────────────────────────────────────────
 DRONES = ["F-4", "I2", "M2", "S-9"]
 
@@ -109,27 +135,17 @@ SLOPE: dict[str, list[float]] = {
     ],
 }
 
-N_BANDS        = 24
-NUM_FEATURES   = 18
-DRONE_FEAT_DIM = 3 + N_BANDS + N_BANDS  # = 51
+DRONE_NORM = {
+    "n_blades": (4.0, 6.0),
+    "rpm":      (800.0, 7000.0),
+    "lp_ref":   (16.0, 75.0),
+    "slope":    (-1.3e-4, 4.5e-2),
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Features — ordre canonique des colonnes (doit matcher gen_graphs.py)
-# ─────────────────────────────────────────────────────────────────────────────
-FEAT_KEYS = [
-    "log_dist", "cos_ns", "rel_x", "rel_y", "rel_z",
-    "log_height", "log_area", "normal_z", "log_horiz_dist", "occluded",
-    "cos_angles", "grazing_angle", "elevation_angle",
-    "obstacle_proximity", "slope_discontinuity",
-    "normal_x", "normal_y", "cos_horiz",
-]
-assert len(FEAT_KEYS) == NUM_FEATURES, "FEAT_KEYS doit avoir NUM_FEATURES entrées"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Stats de normalisation (z-score). Valeurs par défaut écrasées par
-# `node_stats.json` à l'import si le fichier existe.
+# Node feature stats (z-score). Overridden at import time by node_stats.json
+# if it exists (computed by gen_graphs.py during dataset build).
 # ─────────────────────────────────────────────────────────────────────────────
 NODE_STATS: dict[str, tuple[float, float]] = {
     "log_dist":            (1.2334,  0.2244),
@@ -141,7 +157,6 @@ NODE_STATS: dict[str, tuple[float, float]] = {
     "log_area":            (0.0280,  0.0197),
     "normal_z":            (0.4053,  0.6046),
     "log_horiz_dist":      (1.2245,  0.2351),
-    "occluded":            (0.3065,  0.4610),
     "cos_angles":          (0.4793,  0.5988),
     "grazing_angle":       (0.1860,  0.3684),
     "elevation_angle":     (0.9263,  0.0335),
@@ -150,20 +165,44 @@ NODE_STATS: dict[str, tuple[float, float]] = {
     "normal_x":            (0.0,     0.5),
     "normal_y":            (0.0,     0.5),
     "cos_horiz":           (0.0,     0.5),
+    "is_occluded":         (0.3,     0.5),
+    "first_obstacle_frac": (0.7,     0.3),
+    "log_n_intersections": (0.4,     0.6),
+    "log_dist_to_lit":     (0.5,     0.5),
+    "log_n_lit_nearby":    (2.0,     1.5),
+    "reflect_score":       (0.3,     0.2),
 }
 
-DRONE_NORM = {
-    "n_blades": (4.0, 6.0),
-    "rpm":      (800.0, 7000.0),
-    "lp_ref":   (16.0, 75.0),
-    "slope":    (-1.3e-4, 4.5e-2),
-}
+# Radius (mesh units) for the lit-neighbour ball query used by the
+# reflection-proxy features. Mesh scale is 1 unit = 100 m, so 0.05 ≈ 5 m,
+# the rough range over which 1-bounce reflection still contributes
+# meaningfully in dense urban acoustics.
+REFLECT_RADIUS = 0.05
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Feature vector dimensions + canonical key order
+# ─────────────────────────────────────────────────────────────────────────────
+N_BANDS        = 24
+NUM_FEATURES   = 23
+DRONE_FEAT_DIM = 3 + N_BANDS + N_BANDS  # = 51
+
+FEAT_KEYS = [
+    "log_dist", "cos_ns", "rel_x", "rel_y", "rel_z",
+    "log_height", "log_area", "normal_z", "log_horiz_dist",
+    "cos_angles", "grazing_angle", "elevation_angle",
+    "obstacle_proximity", "slope_discontinuity",
+    "normal_x", "normal_y", "cos_horiz",
+    "is_occluded", "first_obstacle_frac", "log_n_intersections",
+    "log_dist_to_lit", "log_n_lit_nearby", "reflect_score",
+]
+assert len(FEAT_KEYS) == NUM_FEATURES, "FEAT_KEYS doit avoir NUM_FEATURES entrées"
 
 
 def _load_stats_from_json() -> None:
-    """Si STATS_FILE existe, écrase NODE_STATS avec les vraies valeurs calculées
-    par gen_graphs.py. Permet à infer.py d'utiliser automatiquement les bonnes
-    stats sans modification de code."""
+    """If STATS_FILE exists, overwrite NODE_STATS with the values measured by
+    gen_graphs.py during the dataset build. Lets infer.py use the right stats
+    without code changes."""
     if not STATS_FILE.exists():
         return
     try:
@@ -179,7 +218,7 @@ _load_stats_from_json()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Mapping classes ↔ couleurs RGB
+# Class ↔ RGB mapping
 # ─────────────────────────────────────────────────────────────────────────────
 RGB_TO_CLASS: dict[tuple[int, int, int], int] = {
     (128,   0, 200): 0,   # violet    SPL < 0 dB
@@ -195,309 +234,14 @@ RGB_TOLERANCE = 8   # ±8 par canal pour absorber les arrondis de rendu
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Filename pattern
+# Filename pattern for NoiseMap_*.ply
 # ─────────────────────────────────────────────────────────────────────────────
 FNAME_RE = re.compile(
     r"^NoiseMap_"
-    r"(?P<map>[^_]+(?:_[^_]+)*?)_"   # map_name : tout jusqu'aux 3 floats
+    r"(?P<map>[^_]+(?:_[^_]+)*?)_"   # map_name : up to the three floats
     r"(?P<x>[+-]?\d+(?:\.\d+)?)_"
     r"(?P<y>[+-]?\d+(?:\.\d+)?)_"
     r"(?P<z>[+-]?\d+(?:\.\d+)?)_"
-    r"(?P<drone>.+)"                  # drone_id : tout le reste (peut contenir _)
+    r"(?P<drone>.+)"                  # drone_id : everything else (may contain _)
     r"\.ply$"
 )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Drone feature normalization (vecteur acoustique 51-dim)
-# ─────────────────────────────────────────────────────────────────────────────
-def _normalize_drone_vector(drone: str) -> np.ndarray:
-    """Retourne le vecteur acoustique 51-dim normalisé en [0, 1] (float32)."""
-    n, rmin, rmax = META[drone]
-
-    n_norm    = (n    - DRONE_NORM["n_blades"][0]) / (
-                 DRONE_NORM["n_blades"][1] - DRONE_NORM["n_blades"][0])
-    rmin_norm = (rmin - DRONE_NORM["rpm"][0]) / (
-                 DRONE_NORM["rpm"][1] - DRONE_NORM["rpm"][0])
-    rmax_norm = (rmax - DRONE_NORM["rpm"][0]) / (
-                 DRONE_NORM["rpm"][1] - DRONE_NORM["rpm"][0])
-
-    lp      = np.array(LP_REF[drone], dtype=np.float32)
-    lp_norm = (lp - DRONE_NORM["lp_ref"][0]) / (
-               DRONE_NORM["lp_ref"][1] - DRONE_NORM["lp_ref"][0])
-
-    sl      = np.array(SLOPE[drone], dtype=np.float32)
-    sl_norm = (sl - DRONE_NORM["slope"][0]) / (
-               DRONE_NORM["slope"][1] - DRONE_NORM["slope"][0])
-
-    return np.concatenate(
-        [[n_norm, rmin_norm, rmax_norm], lp_norm, sl_norm]
-    ).astype(np.float32)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Node feature normalization (z-score avec NODE_STATS)
-# ─────────────────────────────────────────────────────────────────────────────
-def _normalize_node_features(feats: np.ndarray) -> np.ndarray:
-    """Z-score des features nœuds avec les stats globales (NODE_STATS)."""
-    means = np.array([NODE_STATS[k][0] for k in FEAT_KEYS], dtype=np.float32)
-    stds  = np.array([NODE_STATS[k][1] for k in FEAT_KEYS], dtype=np.float32)
-    stds  = np.where(stds > 1e-8, stds, 1.0)   # garde-fou
-    return ((feats - means) / stds).astype(np.float32)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PLY parser (ASCII uniquement)
-# ─────────────────────────────────────────────────────────────────────────────
-def _parse_header(f) -> list[tuple[str, int, list[tuple[str, bool]]]]:
-    """Parse le header PLY ASCII; retourne [(elem_name, count, props), …]."""
-    first = f.readline().strip()
-    if first != "ply":
-        raise ValueError("not a PLY file")
-    fmt = f.readline().strip()
-    if "ascii" not in fmt:
-        raise ValueError(f"only ASCII PLY supported, got: {fmt}")
-
-    elements: list[tuple[str, int, list]] = []
-    current: Optional[tuple] = None
-
-    while True:
-        line = f.readline()
-        if not line:
-            raise ValueError("unexpected EOF in PLY header")
-        line = line.strip()
-        if line == "end_header":
-            break
-        if line.startswith(("comment", "format", "obj_info")):
-            continue
-
-        toks = line.split()
-        if toks[0] == "element":
-            if current is not None:
-                elements.append(current)
-            current = (toks[1], int(toks[2]), [])
-        elif toks[0] == "property" and current is not None:
-            is_list = toks[1] == "list"
-            current[2].append((toks[-1], is_list))
-
-    if current is not None:
-        elements.append(current)
-    return elements
-
-
-def _parse_ply(path: Path):
-    """Parse un PLY ASCII. Retourne (verts, faces, face_rgb).
-
-    verts    : (N, 3) float32
-    faces    : (M, 3) int64   — indices validés
-    face_rgb : (M, 3) uint8
-    """
-    verts = faces = face_rgb = None
-
-    with path.open("r") as f:
-        elements = _parse_header(f)
-
-        for elem_name, n, props in elements:
-            names = [p[0] for p in props]
-
-            if elem_name == "vertex":
-                ix = names.index("x")
-                iy = names.index("y")
-                iz = names.index("z")
-                arr = np.empty((n, 3), dtype=np.float32)
-                for i in range(n):
-                    toks = f.readline().split()
-                    arr[i, 0] = float(toks[ix])
-                    arr[i, 1] = float(toks[iy])
-                    arr[i, 2] = float(toks[iz])
-                verts = arr
-
-            elif elem_name == "face":
-                has_rgb = {"red", "green", "blue"}.issubset(set(names))
-                fa  = np.empty((n, 3), dtype=np.int64)
-                rgb = np.zeros((n, 3), dtype=np.uint8)
-
-                for i in range(n):
-                    toks = f.readline().split()
-                    pos  = 0
-                    vals: dict[str, object] = {}
-
-                    for name, is_list in props:
-                        if is_list:
-                            k = int(toks[pos]); pos += 1
-                            vals[name] = toks[pos: pos + k]; pos += k
-                        else:
-                            vals[name] = toks[pos]; pos += 1
-
-                    vi = vals["vertex_indices"]
-                    fa[i, 0] = int(vi[0])
-                    fa[i, 1] = int(vi[1])
-                    fa[i, 2] = int(vi[2])
-                    if has_rgb:
-                        rgb[i, 0] = int(vals["red"])
-                        rgb[i, 1] = int(vals["green"])
-                        rgb[i, 2] = int(vals["blue"])
-
-                faces    = fa
-                face_rgb = rgb
-
-            else:
-                for _ in range(n):
-                    f.readline()
-
-    if verts is None or faces is None or face_rgb is None:
-        raise ValueError(f"{path}: missing vertex or face element")
-
-    # Validation des indices
-    n_verts = verts.shape[0]
-    valid = (
-        (faces[:, 0] >= 0) & (faces[:, 0] < n_verts) &
-        (faces[:, 1] >= 0) & (faces[:, 1] < n_verts) &
-        (faces[:, 2] >= 0) & (faces[:, 2] < n_verts)
-    )
-    if not valid.all():
-        warnings.warn(f"{path.name}: dropped {int((~valid).sum())} invalid faces")
-        faces, face_rgb = faces[valid], face_rgb[valid]
-
-    # Faces dégénérées
-    degen = (
-        (faces[:, 0] == faces[:, 1]) |
-        (faces[:, 1] == faces[:, 2]) |
-        (faces[:, 0] == faces[:, 2])
-    )
-    if degen.any():
-        warnings.warn(f"{path.name}: dropped {int(degen.sum())} degenerate faces")
-        faces, face_rgb = faces[~degen], face_rgb[~degen]
-
-    return verts, faces, face_rgb
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Face adjacency (edges entre faces partageant une arête)
-# ─────────────────────────────────────────────────────────────────────────────
-def _face_adjacency(faces: np.ndarray) -> np.ndarray:
-    """Construit edge_index (2, E) symétrique et dédupliqué entre faces."""
-    n = faces.shape[0]
-    if n == 0:
-        return np.empty((2, 0), dtype=np.int64)
-
-    e = np.concatenate([
-        np.sort(faces[:, [0, 1]], axis=1),
-        np.sort(faces[:, [1, 2]], axis=1),
-        np.sort(faces[:, [0, 2]], axis=1),
-    ], axis=0)
-
-    fid    = np.tile(np.arange(n, dtype=np.int64), 3)
-    order  = np.lexsort((e[:, 1], e[:, 0]))
-    e_s    = e[order]
-    fid_s  = fid[order]
-
-    eq  = (e_s[1:, 0] == e_s[:-1, 0]) & (e_s[1:, 1] == e_s[:-1, 1])
-    src = fid_s[:-1][eq]
-    dst = fid_s[1:][eq]
-
-    if src.size == 0:
-        return np.empty((2, 0), dtype=np.int64)
-
-    s = np.concatenate([src, dst])
-    d = np.concatenate([dst, src])
-    no_self = s != d
-    s, d = s[no_self], d[no_self]
-
-    pairs = np.unique(np.stack([s, d], axis=1), axis=0)
-    return pairs.T.astype(np.int64)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Classification RGB → classe
-# ─────────────────────────────────────────────────────────────────────────────
-def _classify_with_tolerance(rgb: np.ndarray) -> np.ndarray:
-    """Mappe (N, 3) uint8 RGB → classes; inconnu → -1.
-
-    Tolérance ±RGB_TOLERANCE par canal pour absorber les arrondis de rendu.
-    """
-    y     = np.full(rgb.shape[0], -1, dtype=np.int64)
-    rgb_f = rgb.astype(np.int16)
-
-    for (r, g, b), cls in RGB_TO_CLASS.items():
-        mask = (
-            (np.abs(rgb_f[:, 0] - r) <= RGB_TOLERANCE) &
-            (np.abs(rgb_f[:, 1] - g) <= RGB_TOLERANCE) &
-            (np.abs(rgb_f[:, 2] - b) <= RGB_TOLERANCE)
-        )
-        y[mask] = cls
-
-    return y
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Cache des meshes de base (ray-cast occlusion via trimesh BVH)
-# ─────────────────────────────────────────────────────────────────────────────
-_BASE_MESH_CACHE: dict[str, "object"] = {}
-_OCC_CHUNK = 4096   # taille de batch de rayons (RAM bounded)
-
-
-def _load_base_mesh(map_name: str):
-    """Charge avec cache le mesh de base depuis BLENDER_DIR/<map_name>.ply."""
-    if map_name in _BASE_MESH_CACHE:
-        return _BASE_MESH_CACHE[map_name]
-    import trimesh   # import local : évite la dépendance dure
-    ply = BLENDER_DIR / f"{map_name}.ply"
-    if not ply.exists():
-        warnings.warn(
-            f"base mesh for '{map_name}' not found at {ply} — "
-            f"occlusion feature will be all zeros"
-        )
-        _BASE_MESH_CACHE[map_name] = None
-        return None
-    mesh = trimesh.load(str(ply), process=False, force="mesh")
-    # Purge des triangles quasi-dégénérés (causent NaN dans points_to_barycentric)
-    keep = mesh.area_faces > 1e-8
-    if not keep.all():
-        mesh.update_faces(keep)
-        mesh.remove_unreferenced_vertices()
-    # Force la construction du BVH
-    _ = mesh.ray.intersects_any(
-        ray_origins=np.array([[0.0, 0.0, 1e6]]),
-        ray_directions=np.array([[0.0, 0.0, -1.0]]),
-    )
-    _BASE_MESH_CACHE[map_name] = mesh
-    return mesh
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Loader du dataset shardé (utilisé par EdgeSAGE.py et infer.py)
-# ─────────────────────────────────────────────────────────────────────────────
-def load_sharded_dataset(shard_dir: Path = SHARD_DIR):
-    """Charge tous les shards en mémoire et retourne (graphs, metas).
-
-    Pic mémoire ≈ taille totale du dataset (pas de torch.save serialisation),
-    sensiblement plus léger que l'ancien `torch.load(graphs.pt)` qui devait
-    désérialiser un blob unique de plusieurs GB.
-
-    metas[i] = {map, drone, class_counts, n_nodes} pour le graphe i.
-    """
-    import torch
-    shard_paths = sorted(shard_dir.glob("shard_*.pt"))
-    if not shard_paths:
-        raise FileNotFoundError(f"Aucun shard trouvé dans {shard_dir}")
-
-    graphs: list = []
-    metas:  list[dict] = []
-
-    for p in shard_paths:
-        chunk = torch.load(p, weights_only=False)
-        for g in chunk:
-            y_np   = g.y.numpy()
-            valid  = y_np >= 0
-            counts = (np.bincount(y_np[valid], minlength=NUM_CLASSES).tolist()
-                      if valid.any() else [0] * NUM_CLASSES)
-            metas.append({
-                "map":          getattr(g, "map_name", "unknown"),
-                "drone":        getattr(g, "drone_id", "unknown"),
-                "class_counts": counts,
-                "n_nodes":      int(g.num_nodes),
-            })
-            graphs.append(g)
-
-    return graphs, metas

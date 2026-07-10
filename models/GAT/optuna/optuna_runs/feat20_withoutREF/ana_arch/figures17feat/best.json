@@ -1,0 +1,10 @@
+{
+  "metric": "f1m+mcc",
+  "value": 0.6231233679578876,
+  "trial": 22,
+  "params": {
+    "num_layers": 6,
+    "num_heads": 4,
+    "attn_dropout": 0.3956325505363167
+  }
+}

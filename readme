@@ -1,3 +1,28 @@
+Le problème avec bal_acc (= moyenne des rappels par classe)
+
+Elle ne regarde que le rappel, jamais la précision.
+L'optimiseur peut booster fortement les poids des classes rares → le modèle prédit "rare" à tort très souvent → le rappel monte, bal_acc aussi, mais la précision s'effondre.
+C'est exactement le piège qu'Optuna va exploiter ici : tu lui demandes de trouver des poids, il va trouver ceux qui maximisent le rappel des classes rares au détriment de tout le reste.
+f1m (F1 macro)
+
+Moyenne des F1 par classe → équilibre précision/rappel par classe puis moyenne.
+Beaucoup plus difficile à "tricher" avec des poids extrêmes.
+C'est généralement le bon choix par défaut pour du class-weight tuning.
+mcc
+
+Corrélation globale prédictions/vérité, robuste au déséquilibre, prend en compte les 4 quadrants.
+Score unique global (pas per-class), un peu moins interprétable mais très honnête.
+Bonne sanity-check, plus difficile à manipuler que bal_acc.
+Ma recommandation — vu que ton code supporte déjà des métriques combinées via la moyenne arithmétique (optuna_search.py:138-142) :
+
+
+--metric f1m,mcc
+Ça t'évite que l'optimiseur exploite une faiblesse d'une seule métrique, et les deux pénalisent l'effondrement de la précision. Si tu veux quand même garder un œil sur le rappel des classes rares (vu qu'apparemment rare est l'index 6), --metric f1m,mcc,rare peut être pertinent — mais attention à ne pas re-introduire le biais "rappel-only" via rare.
+
+Veux-tu que je sauvegarde ce choix comme préférence projet, ou que je modifie le default du flag --metric pour pointer vers f1m,mcc ?
+
+---
+
 Je crois que gen_graph simplifie le graph
 => [19:54:46] WARNING  Face count mismatch: pred=68255 gt=36275 — matching by nearest centroid.
 

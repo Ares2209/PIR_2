@@ -5,18 +5,32 @@ gen_graphs.py — Génère le dataset de graphes en format shardé.
 Format de sortie :
     processed/shards/shard_XXXX.pt   ← chaque shard = SHARD_SIZE graphes
     processed/node_stats.json         ← stats de normalisation globales
+    processed/shards/.manifest.txt    ← liste des PLYs déjà traités (resume)
 
 Plus jamais de rechargement global du dataset en mémoire.
-Pic mémoire = 1 shard (~500 graphes) + 1 fichier PLY en cours.
+Pic mémoire = 1 shard (~500 graphes) + 1 fichier PLY en cours par worker.
+
+Note : ce script est CPU-bound (parsing PLY, calcul de features, ray-casting
+BVH). Le GPU n'est pas utilisé. La montée en charge passe par le
+multi-process CPU (`--num-workers`, par défaut = `os.cpu_count()`).
 """
 
 from __future__ import annotations
 
+import os
+
+# Limite les threads BLAS/OpenMP à 1 par process : avec mp.Pool, chaque worker
+# fork()é hériterait sinon d'un pool de threads qui rentrerait en concurrence
+# avec les autres workers (sursouscription → 30-50 % de perte). Doit être posé
+# AVANT `import numpy`.
+for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
 import argparse
 import json
 import logging
-import math
-import os
+import multiprocessing as mp
 import re
 import sys
 import warnings
@@ -26,6 +40,7 @@ from typing import Optional
 import numpy as np
 import torch
 from torch_geometric.data import Data
+from tqdm import tqdm
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Chemins — corrigés (plus de triple nesting)
@@ -39,6 +54,7 @@ STATS_FILE = OUT_DIR / "node_stats.json"
 
 SHARD_SIZE = 500   # graphes par fichier shard
 LOG_EVERY  = 100   # log de progression tous les N graphes
+MANIFEST_NAME = ".manifest.txt"   # liste des PLYs déjà traités (un chemin par ligne)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -58,208 +74,18 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from config import (
     DRONES, META, LP_REF, SLOPE,
     N_BANDS, NUM_FEATURES, DRONE_FEAT_DIM,
-    NODE_STATS, FEAT_KEYS, DRONE_NORM,
+    FEAT_KEYS,
     RGB_TO_CLASS, NUM_CLASSES, RGB_TOLERANCE,
     FNAME_RE,
-    _normalize_drone_vector,
-    _parse_ply,
-    _face_adjacency,
-    _classify_with_tolerance,
-    _normalize_node_features,
-    _load_base_mesh,
-    _OCC_CHUNK,
-    BLENDER_DIR,
 )
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Construction des features nœuds
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _build_node_features(
-    verts:    np.ndarray,   # (N, 3) float32 — vertices originaux du mesh
-    faces:    np.ndarray,   # (M, 3) int64   — indices vers verts
-    drone_pos: np.ndarray,  # (3,)   float32
-    map_name: str,
-) -> np.ndarray:
-    """
-    Construit la matrice de features (M, 18) pour les faces d'un graphe.
-
-    Features (dans l'ordre canonique FEAT_KEYS) :
-      0  log_dist           distance log au drone
-      1  cos_ns             cosinus normale-source
-      2  rel_x              position relative X normalisée
-      3  rel_y              position relative Y normalisée
-      4  rel_z              position relative Z normalisée
-      5  log_height         log(hauteur du centroïde)
-      6  log_area           log(aire de la face)
-      7  normal_z           composante Z de la normale
-      8  log_horiz_dist     log(distance horizontale)
-      9  occluded           flag d'occlusion ray-cast
-     10  cos_angles         cosinus angle d'incidence horizontal
-     11  grazing_angle      angle rasant normalisé
-     12  elevation_angle    angle d'élévation normalisé
-     13  obstacle_proximity proximité des obstacles
-     14  slope_discontinuity discontinuité de pente
-     15  normal_x           composante X de la normale
-     16  normal_y           composante Y de la normale
-     17  cos_horiz          cosinus angle horizontal drone→face
-    """
-    M = faces.shape[0]
-    if M == 0:
-        return np.empty((0, NUM_FEATURES), dtype=np.float32)
-
-    # ── Centroïdes et normales des faces ─────────────────────────────────────
-    v0 = verts[faces[:, 0]]
-    v1 = verts[faces[:, 1]]
-    v2 = verts[faces[:, 2]]
-    centroids = (v0 + v1 + v2) / 3.0   # (M, 3)
-
-    e1 = v1 - v0
-    e2 = v2 - v0
-    raw_normals = np.cross(e1, e2)      # (M, 3)
-    norms       = np.linalg.norm(raw_normals, axis=1, keepdims=True)
-    norms       = np.where(norms < 1e-8, 1.0, norms)   # évite /0
-    normals     = raw_normals / norms   # (M, 3) unitaires
-
-    # ── Aires des faces ───────────────────────────────────────────────────────
-    areas = np.linalg.norm(raw_normals, axis=1) * 0.5   # (M,)
-    areas = np.clip(areas, 1e-6, None)
-
-    # ── Vecteurs drone→face ───────────────────────────────────────────────────
-    diff      = centroids - drone_pos[np.newaxis, :]    # (M, 3)
-    dists     = np.linalg.norm(diff, axis=1)            # (M,)
-    dists     = np.clip(dists, 1e-3, None)
-    dirs      = diff / dists[:, np.newaxis]             # (M, 3) unitaires
-
-    log_dist  = np.log1p(dists).astype(np.float32)
-
-    # cos(normale, direction source→face) — négatif : face bien orientée
-    cos_ns    = np.einsum("ij,ij->i", normals, -dirs).astype(np.float32)
-
-    # Positions relatives normalisées par la distance
-    rel_xyz   = (diff / dists[:, np.newaxis]).astype(np.float32)   # (M, 3)
-
-    log_height = np.log1p(np.abs(centroids[:, 2])).astype(np.float32)
-    log_area   = np.log1p(areas).astype(np.float32)
-
-    normal_z   = normals[:, 2].astype(np.float32)
-    normal_x   = normals[:, 0].astype(np.float32)
-    normal_y   = normals[:, 1].astype(np.float32)
-
-    horiz_dist  = np.sqrt(diff[:, 0]**2 + diff[:, 1]**2)
-    horiz_dist  = np.clip(horiz_dist, 1e-3, None)
-    log_horiz_dist = np.log1p(horiz_dist).astype(np.float32)
-
-    # Angle d'élévation (drone vu depuis la face)
-    elev_angle  = np.arctan2(-diff[:, 2], horiz_dist)   # (M,)
-    elev_norm   = (elev_angle / (math.pi / 2)).astype(np.float32)
-    elev_norm   = np.clip(elev_norm, -1.0, 1.0)
-
-    # Angle rasant (complément de l'angle d'élévation)
-    grazing     = (math.pi / 2 - np.abs(elev_angle)) / (math.pi / 2)
-    grazing     = grazing.astype(np.float32)
-
-    # cos_angles = cosinus 3D entre normale et direction face→drone
-    # (= cos_ns ; conservé séparément pour cohérence avec FEAT_KEYS).
-    cos_angles  = cos_ns.copy()
-
-    # cos_horiz  = cosinus dans le plan XY uniquement (occlusion latérale,
-    # indépendante de l'élévation). Apporte une info distincte de cos_ns.
-    horiz_dir   = diff[:, :2] / horiz_dist[:, np.newaxis]   # (M, 2) unitaire
-    normal_h    = normals[:, :2]
-    norm_h_norm = np.linalg.norm(normal_h, axis=1, keepdims=True)
-    norm_h_norm = np.where(norm_h_norm < 1e-8, 1.0, norm_h_norm)
-    normal_h_u  = normal_h / norm_h_norm
-    cos_horiz   = np.einsum("ij,ij->i", normal_h_u, -horiz_dir).astype(np.float32)
-
-    # Discontinuité de pente (variance locale des normales via arêtes adjacentes)
-    # Approximation : std de normal_z dans un voisinage 1-ring reconstruit
-    # ici on utilise une version simplifiée : |Δnormal_z| moyenné sur les arêtes
-    adj = _face_adjacency(faces)
-    if adj.shape[1] > 0:
-        src_e, dst_e = adj[0], adj[1]
-        delta_nz = np.abs(normal_z[src_e] - normal_z[dst_e])
-        # Accumulation par face source
-        slope_disc = np.zeros(M, dtype=np.float32)
-        np.add.at(slope_disc, src_e, delta_nz)
-        degree = np.bincount(src_e, minlength=M).astype(np.float32)
-        degree = np.where(degree < 1, 1.0, degree)
-        slope_disc /= degree
-    else:
-        slope_disc = np.zeros(M, dtype=np.float32)
-
-    # Proximité d'obstacles : inverse de la distance normalisée
-    obstacle_prox = (1.0 / (1.0 + dists)).astype(np.float32)
-
-    # ── Occlusion par ray-cast ────────────────────────────────────────────────
-    occluded = _compute_occlusion(centroids, drone_pos, map_name)
-
-    # ── Assemblage ────────────────────────────────────────────────────────────
-    feats = np.stack([
-        log_dist,           # 0
-        cos_ns,             # 1
-        rel_xyz[:, 0],      # 2  rel_x
-        rel_xyz[:, 1],      # 3  rel_y
-        rel_xyz[:, 2],      # 4  rel_z
-        log_height,         # 5
-        log_area,           # 6
-        normal_z,           # 7
-        log_horiz_dist,     # 8
-        occluded,           # 9
-        cos_angles,         # 10
-        grazing,            # 11
-        elev_norm,          # 12
-        obstacle_prox,      # 13
-        slope_disc,         # 14
-        normal_x,           # 15
-        normal_y,           # 16
-        cos_horiz,          # 17
-    ], axis=1)              # (M, 18)
-
-    return feats.astype(np.float32)
-
-
-def _compute_occlusion(
-    centroids: np.ndarray,   # (M, 3)
-    drone_pos: np.ndarray,   # (3,)
-    map_name:  str,
-) -> np.ndarray:             # (M,) float32 ∈ {0, 1}
-    """
-    Ray-cast depuis chaque centroïde vers le drone.
-    Retourne 1.0 si occulté, 0.0 sinon.
-    Utilise le BVH du mesh de base (chargé une fois par map_name).
-    """
-    mesh = _load_base_mesh(map_name)
-    M    = centroids.shape[0]
-    occ  = np.zeros(M, dtype=np.float32)
-
-    if mesh is None:
-        return occ
-
-    target = drone_pos[np.newaxis, :]   # (1, 3)
-
-    for start in range(0, M, _OCC_CHUNK):
-        end   = min(start + _OCC_CHUNK, M)
-        origs = centroids[start:end]            # (chunk, 3)
-        dirs  = target - origs                  # (chunk, 3)
-        dists = np.linalg.norm(dirs, axis=1, keepdims=True)
-        dists = np.where(dists < 1e-6, 1.0, dists)
-        dirs_u = dirs / dists                   # unitaires
-
-        # Léger offset pour éviter auto-intersection
-        origs_offset = origs + dirs_u * 1e-3
-
-        try:
-            hits = mesh.ray.intersects_any(
-                ray_origins=origs_offset,
-                ray_directions=dirs_u,
-            )
-            occ[start:end] = hits.astype(np.float32)
-        except Exception as exc:
-            warnings.warn(f"ray-cast error (map={map_name}): {exc}")
-
-    return occ
-
+from dataio import (
+    _build_node_features,
+    _classify_with_tolerance,
+    _face_adjacency,
+    _normalize_drone_vector,
+    _normalize_node_features,
+    _parse_ply,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Conversion PLY → Data PyG
@@ -328,7 +154,7 @@ def ply_to_graph(path: Path) -> Optional[Data]:
 
     # ── Assemblage PyG ────────────────────────────────────────────────────────
     data = Data(
-        x          = torch.from_numpy(node_feats),              # (M, 18)
+        x          = torch.from_numpy(node_feats),              # (M, 17)
         edge_index = torch.from_numpy(edge_index).long(),       # (2, E)
         y          = torch.from_numpy(y).long(),                # (M,)
         drone_feat = torch.from_numpy(drone_vec).unsqueeze(0),  # (1, 51)
@@ -481,14 +307,199 @@ def save_stats_json(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Workers multi-process (top-level pour être picklable par mp.Pool)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _worker_build_graph(path_str: str):
+    """Construit un graphe à partir d'un chemin PLY.
+
+    Retourne un tuple (path_str, status, graph_or_none) :
+      - status == "ok"   : graphe valide
+      - status == "skip" : aucun label valide
+      - status == "err"  : parsing / ply_to_graph a échoué
+    """
+    try:
+        g = ply_to_graph(Path(path_str))
+    except Exception:
+        return path_str, "err", None
+    if g is None:
+        return path_str, "err", None
+    if (g.y >= 0).sum().item() == 0:
+        return path_str, "skip", None
+    return path_str, "ok", g
+
+
+def _worker_partial_welford(shard_path_str: str):
+    """Welford partiel sur un shard. Retourne (n, mean, M2)."""
+    graphs = torch.load(Path(shard_path_str), weights_only=False)
+    acc = _WelfordAccumulator(NUM_FEATURES)
+    for g in graphs:
+        acc.update_batch(g.x.numpy())
+    return acc.n, acc.mean, acc.M2
+
+
+def _combine_welford(a, b):
+    """Combine deux accumulateurs Welford : (n, mean, M2)."""
+    nA, meanA, M2_A = a
+    nB, meanB, M2_B = b
+    n = nA + nB
+    if n == 0:
+        return 0, np.zeros_like(meanA), np.zeros_like(M2_A)
+    delta = meanB - meanA
+    mean  = meanA + delta * (nB / n)
+    M2    = M2_A + M2_B + (delta ** 2) * (nA * nB / n)
+    return n, mean, M2
+
+
+def _worker_normalize_shard(args):
+    """Normalise un shard in-place. args = (shard_path_str, mean_np, std_np)."""
+    shard_path_str, mean_np, std_np = args
+    shard_path = Path(shard_path_str)
+    mean_t = torch.from_numpy(mean_np)
+    std_t  = torch.from_numpy(std_np)
+    graphs: list[Data] = torch.load(shard_path, weights_only=False)
+    for g in graphs:
+        g.x = ((g.x - mean_t) / std_t).float()
+    torch.save(graphs, shard_path)
+    return shard_path.name
+
+
+def compute_stats_parallel(shard_dir: Path, n_workers: int) -> tuple[np.ndarray, np.ndarray]:
+    """Welford parallèle sur les shards. Pic mémoire = n_workers shards."""
+    shards = sorted(shard_dir.glob("shard_*.pt"))
+    log.info(f"Stats : {len(shards)} shards | {n_workers} workers")
+
+    n_total = 0
+    mean    = np.zeros(NUM_FEATURES, dtype=np.float64)
+    M2      = np.zeros(NUM_FEATURES, dtype=np.float64)
+
+    if n_workers <= 1 or len(shards) <= 1:
+        for s in tqdm(shards, desc="welford", unit="shard"):
+            n_total, mean, M2 = _combine_welford(
+                (n_total, mean, M2), _worker_partial_welford(str(s))
+            )
+    else:
+        with mp.Pool(processes=n_workers) as pool:
+            it = pool.imap_unordered(_worker_partial_welford,
+                                     [str(s) for s in shards])
+            for partial in tqdm(it, total=len(shards), desc="welford", unit="shard"):
+                n_total, mean, M2 = _combine_welford((n_total, mean, M2), partial)
+
+    if n_total < 2:
+        return mean.astype(np.float32), np.ones(NUM_FEATURES, dtype=np.float32)
+    variance = M2 / (n_total - 1)
+    std      = np.sqrt(np.maximum(variance, 1e-8))
+    log.info(f"Stats calculées sur {n_total:,} nœuds.")
+    return mean.astype(np.float32), std.astype(np.float32)
+
+
+def normalize_shards_parallel(
+    shard_dir: Path, mean: np.ndarray, std: np.ndarray, n_workers: int
+) -> None:
+    """Applique la normalisation aux shards en parallèle."""
+    shards = sorted(shard_dir.glob("shard_*.pt"))
+    log.info(f"Normalisation : {len(shards)} shards | {n_workers} workers")
+    args_list = [(str(s), mean, std) for s in shards]
+
+    if n_workers <= 1 or len(shards) <= 1:
+        for a in tqdm(args_list, desc="normalize", unit="shard"):
+            _worker_normalize_shard(a)
+    else:
+        with mp.Pool(processes=n_workers) as pool:
+            it = pool.imap_unordered(_worker_normalize_shard, args_list)
+            for _ in tqdm(it, total=len(shards), desc="normalize", unit="shard"):
+                pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Manifest (resume robuste, indépendant de l'ordre de traitement)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_manifest(shard_dir: Path) -> set[str]:
+    p = shard_dir / MANIFEST_NAME
+    if not p.exists():
+        return set()
+    return {ln.strip() for ln in p.read_text().splitlines() if ln.strip()}
+
+
+def _bootstrap_manifest_from_shards(shard_dir: Path) -> set[str]:
+    """Reconstruit un manifest depuis les shards existants (compat avec l'ancien
+    mode séquentiel sans manifest). On dérive le chemin PLY attendu depuis
+    map_name + drone_id + drone_pos, en s'appuyant sur la convention de nommage."""
+    done: set[str] = set()
+    shards = sorted(shard_dir.glob("shard_*.pt"))
+    if not shards:
+        return done
+    log.info(f"Aucun manifest : reconstruction depuis {len(shards)} shards existants...")
+    for s in tqdm(shards, desc="scan-shards", unit="shard"):
+        try:
+            graphs: list[Data] = torch.load(s, weights_only=False)
+        except Exception:
+            continue
+        for g in graphs:
+            map_name  = getattr(g, "map_name", None)
+            drone_id  = getattr(g, "drone_id", None)
+            drone_pos = getattr(g, "drone_pos", None)
+            if map_name is None or drone_id is None or drone_pos is None:
+                continue
+            x, y, z = (float(v) for v in drone_pos.tolist())
+            # Convention : NoiseMap_{map}_{x}_{y}_{z}_{drone}.ply, sous {drone}/
+            fname = f"NoiseMap_{map_name}_{x}_{y}_{z}_{drone_id}.ply"
+            done.add(fname)   # on stocke juste le nom de fichier (cf. _resume_filter)
+    log.info(f"Manifest reconstruit : {len(done)} entrées (par nom de fichier).")
+    return done
+
+
+def _resume_filter(ply_files: list[Path], done: set[str]) -> list[Path]:
+    """Retourne les PLYs non encore traités. Accepte un manifest contenant
+    soit des chemins absolus, soit des noms de fichier (mode bootstrap)."""
+    if not done:
+        return list(ply_files)
+    out = []
+    for p in ply_files:
+        if str(p) in done or p.name in done:
+            continue
+        out.append(p)
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Boucle principale
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _check_shard_feature_dim(shard_dir: Path) -> None:
+    """If shards already exist, make sure their feature dim matches the
+    current NUM_FEATURES. Catches the common pitfall of resuming on top of
+    shards built by a previous version of `_build_node_features`."""
+    existing = sorted(shard_dir.glob("shard_*.pt"))
+    if not existing:
+        return
+    try:
+        sample = torch.load(existing[0], weights_only=False)
+    except Exception as exc:
+        log.warning(f"Could not introspect {existing[0].name}: {exc}")
+        return
+    if not sample:
+        return
+    got = int(sample[0].x.shape[1])
+    if got != NUM_FEATURES:
+        log.error(
+            f"Existing shards have x with {got} feature columns, but the "
+            f"current code emits {NUM_FEATURES} (FEAT_KEYS changed). The two "
+            f"are not compatible — Welford / normalisation would crash or "
+            f"produce wrong stats.\n"
+            f"  Fix: re-run with --no-resume to discard {shard_dir} and "
+            f"rebuild from scratch."
+        )
+        sys.exit(2)
+
 
 def build_dataset(
     generated_dir: Path,
     shard_dir:     Path,
     resume:        bool = True,
     normalize:     bool = True,
+    num_workers:   int  = 1,
 ) -> None:
     """
     Construit le dataset shardé depuis les fichiers PLY générés.
@@ -499,6 +510,7 @@ def build_dataset(
                 NoiseMap_{ville}_{x}_{y}_{z}_{drone_name}.ply
                 ...
     """
+    _check_shard_feature_dim(shard_dir)
     # ── Collecte récursive de tous les PLY ────────────────────────────────────
     ply_files = sorted(generated_dir.rglob("NoiseMap_*.ply"))
     if not ply_files:
@@ -517,93 +529,111 @@ def build_dataset(
     for drone_name, count in sorted(drones_found.items()):
         log.info(f"  {drone_name:30s} : {count:,} fichiers")
 
-    # ── Calcul du point de reprise ─────────────────────────────────────────────
-    existing_shards = sorted(shard_dir.glob("shard_*.pt")) if resume else []
-    n_already_done  = 0
+    shard_dir.mkdir(parents=True, exist_ok=True)
 
-    if existing_shards and resume:
-        # Charge le dernier shard pour connaître son vrai count
-        last_shard_idx = len(existing_shards) - 1
-        last_shard     = existing_shards[-1]
-        last_graphs    = torch.load(last_shard, weights_only=False)
-        last_count     = len(last_graphs)
-        del last_graphs
+    # ── Resume via manifest ───────────────────────────────────────────────────
+    done: set[str] = set()
+    if resume:
+        done = _load_manifest(shard_dir)
+        if not done and any(shard_dir.glob("shard_*.pt")):
+            # Compat avec l'ancien build séquentiel sans manifest
+            done = _bootstrap_manifest_from_shards(shard_dir)
 
-        # Nombre de graphes = shards complets × SHARD_SIZE + dernier shard
-        n_already_done = last_shard_idx * SHARD_SIZE + last_count
+    todo = _resume_filter(ply_files, done)
+    log.info(
+        f"Resume : {len(done):,} déjà traités | "
+        f"{len(todo):,} à traiter | total {len(ply_files):,}"
+    )
 
-        # Si le dernier shard est incomplet, on le supprime et on reprend
-        # depuis le début de ce shard (évite duplication)
-        if last_count < SHARD_SIZE:
-            log.info(
-                f"Reprise : {last_shard.name} incomplet ({last_count} graphes), "
-                f"suppression et reprise depuis ce shard."
-            )
-            last_shard.unlink()
-            n_already_done = last_shard_idx * SHARD_SIZE
-            existing_shards = existing_shards[:-1]
+    if not todo:
+        log.info("Rien à faire — tous les PLYs sont dans le manifest.")
+        if normalize:
+            _run_normalize(shard_dir, num_workers)
+        return
 
-        log.info(
-            f"Reprise depuis le graphe #{n_already_done} "
-            f"({len(existing_shards)} shards complets déjà présents)"
-        )
+    # ── Tri par map_name pour la localité du cache BVH (chaque worker
+    # voit des batches contigus de la même map → 1 chargement BVH partagé)
+    def _map_key(p: Path) -> str:
+        m = FNAME_RE.match(p.name)
+        return m.group("map") if m else ""
 
-    # ── Création du ShardWriter (continue depuis l'état actuel) ───────────────
+    todo.sort(key=_map_key)
+
+    # ── ShardWriter : on continue à la suite des shards existants ──────────────
+    existing_shards = sorted(shard_dir.glob("shard_*.pt"))
     writer = ShardWriter(shard_dir, SHARD_SIZE)
-    writer.shard_index = len(existing_shards)   # reprend la numérotation
+    writer.shard_index = len(existing_shards)
+    log.info(
+        f"Reprise : shard_index initial = {writer.shard_index} "
+        f"({len(existing_shards)} shards déjà présents)"
+    )
 
-    n_ok   = 0
-    n_skip = 0
-    n_err  = 0
+    # ── Boucle parallèle ──────────────────────────────────────────────────────
+    n_workers = max(1, num_workers)
+    chunksize = max(1, min(64, len(todo) // (n_workers * 4) or 1))
+    log.info(f"Build : {n_workers} workers | chunksize={chunksize}")
 
-    for idx, ply_path in enumerate(ply_files):
+    n_ok = n_skip = n_err = 0
+    todo_strs = [str(p) for p in todo]
+    manifest_path = shard_dir / MANIFEST_NAME
 
-        # Saute les PLY déjà intégrés dans des shards complets
-        if idx < n_already_done:
-            continue
+    pbar = tqdm(total=len(todo_strs), desc="build", unit="ply", dynamic_ncols=True)
 
-        if idx % LOG_EVERY == 0:
-            log.info(
-                f"[{idx:>6}/{len(ply_files)}] "
-                f"ok={n_ok} skip={n_skip} err={n_err} | {ply_path.name}"
-            )
+    def _consume(iterator):
+        nonlocal n_ok, n_skip, n_err
+        with manifest_path.open("a") as manifest_f:
+            for path_str, status, g in iterator:
+                if status == "ok":
+                    writer.add(g)
+                    manifest_f.write(f"{path_str}\n")
+                    n_ok += 1
+                elif status == "skip":
+                    n_skip += 1
+                else:
+                    n_err += 1
+                pbar.update(1)
+                if (n_ok + n_skip + n_err) % LOG_EVERY == 0:
+                    pbar.set_postfix(ok=n_ok, skip=n_skip, err=n_err)
+                    manifest_f.flush()
 
-        g = ply_to_graph(ply_path)
-        if g is None:
-            n_err += 1
-            continue
-
-        # Filtre les graphes trop petits ou sans labels valides
-        valid_labels = (g.y >= 0).sum().item()
-        if valid_labels == 0:
-            n_skip += 1
-            continue
-
-        writer.add(g)
-        n_ok += 1
+    try:
+        if n_workers == 1:
+            _consume(_worker_build_graph(s) for s in todo_strs)
+        else:
+            with mp.Pool(processes=n_workers) as pool:
+                _consume(pool.imap_unordered(
+                    _worker_build_graph, todo_strs, chunksize=chunksize
+                ))
+    finally:
+        pbar.close()
 
     total = writer.close()
     log.info(
         f"\n{'─'*60}\n"
-        f"Build terminé : {total:,} graphes dans {writer.shard_index} shards\n"
+        f"Build terminé : {total:,} nouveaux graphes "
+        f"dans {writer.shard_index} shards (cumul)\n"
         f"  ok={n_ok}  skip={n_skip}  err={n_err}\n"
         f"Sortie : {shard_dir}\n"
         f"{'─'*60}"
     )
 
-    if total == 0:
+    if total == 0 and not existing_shards:
         log.error("Aucun graphe valide produit. Vérifiez les PLY.")
         sys.exit(1)
 
-    # ── Normalisation en streaming ─────────────────────────────────────────────
     if normalize:
-        log.info("\n── Passe de normalisation (streaming) ──")
-        mean, std = compute_stats_from_shards(shard_dir)
-        save_stats_json(mean, std, FEAT_KEYS, STATS_FILE)
-        normalize_shards_inplace(shard_dir, mean, std)
-        log.info("Normalisation terminée.")
+        _run_normalize(shard_dir, num_workers)
     else:
         log.info("Normalisation ignorée (--no-normalize).")
+
+
+def _run_normalize(shard_dir: Path, num_workers: int) -> None:
+    """Stats + normalisation in-place, en parallèle."""
+    log.info("\n── Passe de normalisation (parallèle) ──")
+    mean, std = compute_stats_parallel(shard_dir, max(1, num_workers))
+    save_stats_json(mean, std, FEAT_KEYS, STATS_FILE)
+    normalize_shards_parallel(shard_dir, mean, std, max(1, num_workers))
+    log.info("Normalisation terminée.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -634,8 +664,12 @@ def _parse_args() -> argparse.Namespace:
         "--no-normalize", action="store_true",
         help="Saute la passe de normalisation",
     )
+    p.add_argument(
+        "--num-workers", type=int, default=os.cpu_count() or 1,
+        help="Nombre de processus pour le build / les stats / la normalisation "
+             "(default: %(default)s = tous les cœurs CPU). 1 = mode séquentiel.",
+    )
     return p.parse_args()
-
 
 if __name__ == "__main__":
     args = _parse_args()
@@ -644,12 +678,33 @@ if __name__ == "__main__":
 
     if args.no_resume and shard_dir.exists():
         import shutil
-        log.info(f"--no-resume : suppression de {shard_dir}")
+        log.info(f"--no-resume : suppression de {shard_dir} (manifest inclus)")
         shutil.rmtree(shard_dir)
+
+    n_workers = max(1, args.num_workers)
+    n_cpu     = os.cpu_count() or 1
+    n_gpu     = 0
+    try:
+        import torch as _t
+        if _t.cuda.is_available():
+            n_gpu = _t.cuda.device_count()
+    except Exception:
+        pass
+    log.info(
+        f"Ressources : {n_cpu} CPU(s), {n_gpu} GPU(s) | "
+        f"workers utilisés = {n_workers}"
+    )
+    if n_gpu > 0:
+        log.info(
+            "Note : ce script est CPU-bound (parsing PLY + ray-cast BVH + numpy). "
+            "Le GPU n'apporterait qu'un gain marginal sur le ray-casting et serait "
+            "annulé par les transferts ; on sature donc les CPU à la place."
+        )
 
     build_dataset(
         generated_dir = args.generated_dir,
         shard_dir     = shard_dir,
         resume        = not args.no_resume,
         normalize     = not args.no_normalize,
+        num_workers   = n_workers,
     )

@@ -1,0 +1,35 @@
+Study           : gat-class-weights
+Metric          : bal (maximize)
+Weight scale    : normalized (mean=1)
+Total trials    : 85  (complete=52, pruned=32)
+Best trial      : #59  value=0.8463
+  raw weights        : [0.6581, 0.3402, 0.2034, 1.5696, 4.0482, 5.7084, 0.6899]
+  normalized weights : [0.3485, 0.1802, 0.1077, 0.8312, 2.1439, 3.0231, 0.3654]
+  → CLASS_WEIGHTS = [0.349, 0.180, 0.108, 0.831, 2.144, 3.023, 0.365]
+  config actuel     : [0.2100, 0.0590, 0.2110, 0.5890, 1.1270, 4.7540, 0.0490]
+
+Top 5 trials
+ number  value     w0     w1     w2     w3     w4     w5     w6  duration_min
+     59 0.8463 0.3485 0.1802 0.1077 0.8312 2.1439 3.0231 0.3654       71.3982
+     60 0.8414 0.1954 0.0847 0.0615 1.2829 1.5681 3.6754 0.1321       71.4890
+     27 0.8397 0.1066 0.1179 0.3644 2.9085 1.2242 2.0037 0.2748       68.2752
+     73 0.8395 0.0704 0.0285 0.0393 0.7350 4.1341 1.9352 0.0575       35.7997
+     48 0.8383 0.1312 0.3061 0.1636 1.5869 2.5041 1.8936 0.4144       56.5282
+
+Corrélations Spearman log(w_i) ↔ bal
+  w0 (violet   ) : ρ = -0.060
+  w1 (blue     ) : ρ = -0.052
+  w2 (yellow   ) : ρ = -0.138
+  w3 (orange   ) : ρ = +0.242
+  w4 (red      ) : ρ = +0.159
+  w5 (dark_red ) : ρ = +0.392
+  w6 (occluded ) : ρ = -0.319
+
+Importance des poids (fANOVA)
+  w0 (violet)            : 0.279
+  w6 (occluded)          : 0.253
+  w4 (red)               : 0.238
+  w3 (orange)            : 0.102
+  w5 (dark_red)          : 0.079
+  w2 (yellow)            : 0.027
+  w1 (blue)              : 0.022

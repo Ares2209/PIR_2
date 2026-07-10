@@ -41,4 +41,12 @@ generated/
 checkpoints/
 NoiseMap-RT-main/
 
-.pt
+*.pt
+
+venv-local/
+
+# Gros dataset (données générées, non versionnées)
+dataset/data/
+
+# Sorties runtime
+nohup.out

@@ -1,0 +1,19 @@
+{
+  "metric": "f1m,mcc",
+  "metric_names": [
+    "f1m",
+    "mcc"
+  ],
+  "value": 0.7561723603038191,
+  "trial": 49,
+  "best_num_layers": 6,
+  "best_num_heads": 5,
+  "best_attn_dropout": 0.2858666834614854,
+  "params": {
+    "num_layers": 6,
+    "num_heads": 5,
+    "attn_dropout": 0.2858666834614854
+  },
+  "n_completed": 32,
+  "n_pruned": 76
+}

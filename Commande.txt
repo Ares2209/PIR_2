@@ -1,0 +1,5 @@
+python3 models/GAT/gen_graphs.py --no-resume --num-workers 16 2>&1 | tail -40
+
+rsync -avh --progress --exclude='shards/' dormammu:~/stage/PIR/models/GATv2/checkpoints /home/ldena/Bureau/PIR-local/PIR/models/GATv2
+
+python3 models/GATv2/infer.py --drone F-4 --x 4 --y 4 --z 4 --ckpt /home/ldena/Bureau/PIR-local/PIR/models/GATv2/checkpoints/lr5e-04_wd5e-06_bs4__cw0.66-0.34-0.20-1.57-4.05-5.71-0.69/run_20260708_051516/gat_epoch315_score0.8368_acc0.8496.pt

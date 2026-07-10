@@ -1,0 +1,40 @@
+Study           : gat-arch-v1
+Metric          : f1m+mcc (maximize)
+Total trials    : 40  (complete=31, pruned=9)
+Best trial      : #22  value=0.6231
+  num_layers    : 6
+  num_heads     : 4
+  attn_dropout  : 0.3956
+
+Top 5 trials
+ number  value  num_layers  num_heads  attn_dropout  duration_min
+     22 0.6231           6          4        0.3956       39.0796
+     21 0.6187           6          4        0.3588       39.1225
+     37 0.6183           6          4        0.3909       20.9881
+     13 0.6181           6          4        0.3839       39.1298
+     36 0.6174           6          4        0.3793       20.9761
+
+Effet marginal de num_layers
+             mean    std  count
+num_layers                     
+2          0.6051    NaN      1
+3          0.6040    NaN      1
+4          0.6126 0.0018      4
+5          0.6130 0.0014      4
+6          0.6152 0.0037     21
+
+Effet marginal de num_heads
+            mean    std  count
+num_heads                     
+1         0.6123 0.0016      2
+2         0.6110    NaN      1
+3         0.6152 0.0014      8
+4         0.6157 0.0036     14
+5         0.6091 0.0048      6
+
+attn_dropout vs f1m+mcc : Pearson=+0.145  | pente lin.=+0.004
+
+Importance des paramètres (fANOVA)
+  num_layers      : 0.584
+  num_heads       : 0.318
+  attn_dropout    : 0.098
