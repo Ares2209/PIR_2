@@ -3,3 +3,28 @@ python3 models/GAT/gen_graphs.py --no-resume --num-workers 16 2>&1 | tail -40
 rsync -avh --progress --exclude='shards/' dormammu:~/stage/PIR/models/GATv2/checkpoints /home/ldena/Bureau/PIR-local/PIR/models/GATv2
 
 python3 models/GATv2/infer.py --drone F-4 --x 4 --y 4 --z 4 --ckpt /home/ldena/Bureau/PIR-local/PIR/models/GATv2/checkpoints/lr5e-04_wd5e-06_bs4__cw0.66-0.34-0.20-1.57-4.05-5.71-0.69/run_20260708_051516/gat_epoch315_score0.8368_acc0.8496.pt
+
+
+
+gen_graphs : 
+
+setsid nohup python3 models/GAT/gen_graphs.py --no-resume --num-workers 16 2>&1 
+
+Optuna arch : 
+
+setsid nohup python3 models/GAT/optuna/optuna_search_arch.py     --n-trials 40     --layers-min 2 --layers-max 6     --heads-min 1 --heads-max 5     --attn-drop-min 0.0 --attn-drop-max 0.4     --epochs 120 --patience 25 --eval-every 5     --batch-size 2     --study-name gat-arch-v1
+
+Optuna LR : 
+
+setsid nohup python3 models/GAT/optuna/optuna_search_lr.py --n-trials 60 --also-wd > optuna_search_lr.log
+
+Optuna WEIGHT 
+
+setsid nohup python3 models/GAT/optuna/optuna_search.py --n-trials 150 > optuna_search_weight.log
+
+Inference 
+
+python3 models/GATv2/infer.py --drone F-4 --x 4 --y 4 --z 4 --ckpt /home/millot/stage/PIR/models/GATv2/checkpoints/lr5e-04_wd5e-06_bs4__cw0.66-0.34-0.20-1.57-4.05-5.71-0.69/gat_epoch315_score0.8368_acc0.8496.pt
+
+
+python models/GATv2/shap_analysis.py --ckpt /home/millot/stage/PIR/models/GATv2/checkpoints/lr5e-04_wd5e-06_bs2__cw0.66-0.34-0.20-1.57-4.05-5.71-0.69/gat_epoch001_score0.4320_acc0.7401.pt
