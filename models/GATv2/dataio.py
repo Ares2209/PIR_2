@@ -441,7 +441,6 @@ def _build_node_features(
      19  log_n_intersections log1p of #blocking hits along the LOS
      20  log_dist_to_lit    log1p distance to nearest lit (LOS-direct) face
      21  log_n_lit_nearby   log1p count of lit faces within REFLECT_RADIUS
-     22  reflect_score      [0,1] orientation quality of nearby lit reflectors
     """
     M = faces.shape[0]
     if M == 0:
@@ -529,8 +528,9 @@ def _build_node_features(
         verts, faces, centroids, drone_pos,
     )
 
-    # Reflection-proxy trio. Reuses the LOS mask above — no extra ray casting.
-    log_dist_to_lit, log_n_lit_nearby, reflect_score = _reflection_proxy_features(
+    # Reflection-proxy features. Reuses the LOS mask above — no extra ray casting.
+    # (reflect_score, 3e sortie, retiré du modèle → ignoré.)
+    log_dist_to_lit, log_n_lit_nearby, _reflect_score = _reflection_proxy_features(
         centroids, normals, is_occ,
     )
 
@@ -557,7 +557,6 @@ def _build_node_features(
         log_n_inter,        # 19
         log_dist_to_lit,    # 20
         log_n_lit_nearby,   # 21
-        reflect_score,      # 22
     ], axis=1)              # (M, NUM_FEATURES)
 
     return feats.astype(np.float32)
@@ -584,6 +583,13 @@ def load_sharded_dataset(shard_dir: Path = SHARD_DIR):
     for p in shard_paths:
         chunk = torch.load(p, weights_only=False)
         for g in chunk:
+            # Compat rétro : les shards générés en 23 features ont reflect_score
+            # en DERNIÈRE colonne (index 22). reflect_score ayant été retiré du
+            # modèle, on tronque la/les colonne(s) excédentaire(s) pour aligner sur
+            # config.NUM_FEATURES sans avoir à régénérer le dataset. No-op si les
+            # shards sont déjà en NUM_FEATURES (régénérés).
+            if g.x.shape[1] > NUM_FEATURES:
+                g.x = g.x[:, :NUM_FEATURES].contiguous()
             y_np   = g.y.numpy()
             valid  = y_np >= 0
             counts = (np.bincount(y_np[valid], minlength=NUM_CLASSES).tolist()

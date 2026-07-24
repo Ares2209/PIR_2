@@ -11,6 +11,7 @@ Consolidates what used to live in four separate modules:
 
 from __future__ import annotations
 
+import json
 import math
 import shutil
 import time
@@ -27,6 +28,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch_geometric.loader import DataLoader
 
 from config import (
+    CITY_SPLIT_FILE,
     CLASS_WEIGHTS,
     DRONE_NORM,
     EVAL_Z_BALANCE,
@@ -35,6 +37,7 @@ from config import (
     FEAT_KEYS,
     LP_REF,
     META,
+    N_EVAL_CITIES,
     N_TEST_CITIES,
     NODE_STATS,
     NUM_CLASSES,
@@ -44,6 +47,7 @@ from config import (
     RGB_TOLERANCE,
     SHARD_DIR,
     SLOPE,
+    SPLIT_FROM_CITY_FILE,
 )
 
 
@@ -525,8 +529,9 @@ def _build_node_features(
         verts, faces, centroids, drone_pos,
     )
 
-    # Reflection-proxy trio. Reuses the LOS mask above — no extra ray casting.
-    log_dist_to_lit, log_n_lit_nearby, reflect_score = _reflection_proxy_features(
+    # Reflection-proxy features. Reuses the LOS mask above — no extra ray casting.
+    # (reflect_score, 3e sortie, retiré du modèle → ignoré.)
+    log_dist_to_lit, log_n_lit_nearby, _reflect_score = _reflection_proxy_features(
         centroids, normals, is_occ,
     )
 
@@ -553,7 +558,6 @@ def _build_node_features(
         log_n_inter,        # 19
         log_dist_to_lit,    # 20
         log_n_lit_nearby,   # 21
-        reflect_score,      # 22
     ], axis=1)              # (M, NUM_FEATURES)
 
     return feats.astype(np.float32)
@@ -580,6 +584,13 @@ def load_sharded_dataset(shard_dir: Path = SHARD_DIR):
     for p in shard_paths:
         chunk = torch.load(p, weights_only=False)
         for g in chunk:
+            # Compat rétro : les shards générés en 23 features ont reflect_score
+            # en DERNIÈRE colonne (index 22). reflect_score ayant été retiré du
+            # modèle, on tronque la/les colonne(s) excédentaire(s) pour aligner sur
+            # config.NUM_FEATURES sans avoir à régénérer le dataset. No-op si les
+            # shards sont déjà en NUM_FEATURES (régénérés).
+            if g.x.shape[1] > NUM_FEATURES:
+                g.x = g.x[:, :NUM_FEATURES].contiguous()
             y_np   = g.y.numpy()
             valid  = y_np >= 0
             counts = (np.bincount(y_np[valid], minlength=NUM_CLASSES).tolist()
@@ -642,23 +653,109 @@ def _balance_indices_over_z(z_vals: np.ndarray, indices: list[int],
     return sorted(chosen)
 
 
+def _pack_eval_train_split(map_names: list[str], eval_cities: set[str]
+                           ) -> Optional[dict[str, tuple[set[str], list[int]]]]:
+    """Assemble the split dict from a set of evaluation city names:
+
+        val   = graphs whose city ∈ eval_cities
+        train = every other graph
+        test  = val   (final eval reloads the best ckpt and scores it on val)
+
+    Validation cities are whole cities never seen at train time, so they already
+    measure geometric generalisation — hence no separate test set. Returns None
+    when the split is degenerate (val or train empty for the loaded shards)."""
+    val_idx   = sorted(i for i, mn in enumerate(map_names) if mn in eval_cities)
+    train_idx = sorted(i for i, mn in enumerate(map_names) if mn not in eval_cities)
+    if not val_idx or not train_idx:
+        return None
+    val_maps   = {map_names[i] for i in val_idx}
+    train_maps = {map_names[i] for i in train_idx}
+    return {
+        "train": (train_maps, train_idx),
+        "val":   (val_maps,   val_idx),
+        "test":  (set(val_maps), list(val_idx)),   # test == val, no data duplicated
+    }
+
+
+def _city_split_from_file(metas
+                          ) -> Optional[dict[str, tuple[set[str], list[int]]]]:
+    """Build the split from `city_split.json` (copied by gen_graphs.py from the
+    `city_roles.json` written by generate_dataset.py): its `eval_cities` — the
+    normal-condition cities generated with uniform-z and few exercises — become
+    the validation set, every other city the train set.
+
+    Returns None (→ caller falls back to count-based / random split) when the
+    file is absent, unreadable, or lists no eval city present in `metas`."""
+    if not CITY_SPLIT_FILE.exists():
+        return None
+    try:
+        info = json.loads(CITY_SPLIT_FILE.read_text())
+    except Exception as exc:
+        warnings.warn(f"Could not read {CITY_SPLIT_FILE}: {exc}; "
+                      f"falling back to count-based split.")
+        return None
+
+    # `eval_cities` is the current key; `partial_cities` kept for back-compat.
+    eval_cities = set(info.get("eval_cities") or info.get("partial_cities") or [])
+    if not eval_cities:
+        return None
+
+    split = _pack_eval_train_split([m["map"] for m in metas], eval_cities)
+    if split is None:
+        warnings.warn(
+            f"{CITY_SPLIT_FILE.name}: no eval city present in the loaded shards "
+            f"(or no train city left); falling back to count-based split."
+        )
+    return split
+
+
+def _city_split_by_count(metas, n_eval: int = N_EVAL_CITIES
+                         ) -> Optional[dict[str, tuple[set[str], list[int]]]]:
+    """Fallback when the roles file is missing: pick the `n_eval` cities with the
+    fewest graphs as validation (eval cities are generated with clearly fewer
+    exercises), the rest as train. Ties broken by city name for determinism."""
+    map_names = [m["map"] for m in metas]
+    counts: dict[str, int] = {}
+    for mn in map_names:
+        counts[mn] = counts.get(mn, 0) + 1
+    if len(counts) <= n_eval:
+        return None
+    eval_cities = set(sorted(counts, key=lambda c: (counts[c], c))[:n_eval])
+    return _pack_eval_train_split(map_names, eval_cities)
+
+
 def map_level_split(metas, val_ratio: float, test_ratio: float,
                     split_seed: int, *, n_test_cities: int = N_TEST_CITIES,
                     z_balance: bool = EVAL_Z_BALANCE, z_bins: int = EVAL_Z_BINS,
                     z_per_bin=EVAL_Z_PER_BIN,
                     ) -> dict[str, tuple[set[str], list[int]]]:
-    """Hold out `n_test_cities` whole cities for the final test so the model is
+    """Build train/val/test index sets.
+
+    When `SPLIT_FROM_CITY_FILE` is set, the split reuses the eval/train city
+    roles decided at generation time: eval cities → validation, train cities →
+    train (`_city_split_from_file`, or `_city_split_by_count` if the roles file
+    is absent). Otherwise it falls back to the random whole-city hold-out below.
+
+    Hold out `n_test_cities` whole cities for the final test so the model is
     scored on geometry it has never seen; the remaining cities are the training
     pool. Validation (early-stopping / LR scheduler) is carved out graph-level
     from the training pool, so every train city keeps contributing and the test
     cities stay completely clean (no leakage into model selection).
 
-    `test_ratio` is ignored (kept for signature compatibility): the test size is
-    governed by `n_test_cities`. `val_ratio` is the graph-level fraction of the
-    training pool reserved for validation.
+    `test_ratio` is ignored (kept for signature compatibility): the random-
+    fallback test size is governed by `n_test_cities`. `val_ratio` is the
+    graph-level fraction of the training pool reserved for validation.
 
     When `z_balance` is set, the test graphs are subsampled to a roughly uniform
     source-altitude (Z) histogram — see `_balance_indices_over_z`."""
+    if SPLIT_FROM_CITY_FILE:
+        from_file = _city_split_from_file(metas)
+        if from_file is not None:
+            return from_file
+        by_count = _city_split_by_count(metas)
+        if by_count is not None:
+            return by_count
+
     map_names   = [m["map"] for m in metas]
     unique_maps = sorted(set(map_names))
     rng  = torch.Generator().manual_seed(split_seed)

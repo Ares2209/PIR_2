@@ -38,6 +38,24 @@ SPLIT_SEED = 0
 SEED       = 42
 
 # ── Evaluation split ─────────────────────────────────────────────────────────
+# Split strategies, tried in this order when SPLIT_FROM_CITY_FILE is True:
+#
+#   1. City-roles file (city_split.json, copied by gen_graphs.py from the
+#      city_roles.json that generate_dataset.py writes): the eval cities — the
+#      "normal condition" cities generated with uniform-z and a small number of
+#      exercises — become the VALIDATION set; the train cities become the TRAIN
+#      set. No separate test set: validation is the final evaluation (whole
+#      cities never trained on → geometric generalisation).
+#
+#   2. Fallback by exercise count (file absent): the N_EVAL_CITIES cities with
+#      the fewest graphs are taken as validation, the rest as train.
+#
+#   3. Last resort (SPLIT_FROM_CITY_FILE=False, or too few cities): random
+#      whole-city hold-out of N_TEST_CITIES for the test; validation carved
+#      graph-level from the rest (the historical behaviour).
+SPLIT_FROM_CITY_FILE = True   # CITY_SPLIT_FILE path is defined next to SHARD_DIR
+N_EVAL_CITIES        = 4       # fallback-by-count: how many cities → validation
+
 # The final test runs on whole cities the model never saw during training
 # (true geometric generalisation). With 10 cities → 7 train / 3 test by default.
 # Validation (early-stopping / LR scheduler) is carved out graph-level from the
@@ -75,6 +93,7 @@ GENERATED   = REPO_ROOT / "dataset" / "data" / "generated"
 OUT_DIR     = GENERATED / "processed"
 SHARD_DIR   = OUT_DIR / "shards"
 STATS_FILE  = OUT_DIR / "node_stats.json"
+CITY_SPLIT_FILE = OUT_DIR / "city_split.json"   # eval/train city roles (gen_graphs)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -170,7 +189,6 @@ NODE_STATS: dict[str, tuple[float, float]] = {
     "log_n_intersections": (0.4,     0.6),
     "log_dist_to_lit":     (0.5,     0.5),
     "log_n_lit_nearby":    (2.0,     1.5),
-    "reflect_score":       (0.3,     0.2),
 }
 
 # Radius (mesh units) for the lit-neighbour ball query used by the
@@ -184,9 +202,12 @@ REFLECT_RADIUS = 0.05
 # Feature vector dimensions + canonical key order
 # ─────────────────────────────────────────────────────────────────────────────
 N_BANDS        = 24
-NUM_FEATURES   = 23
+NUM_FEATURES   = 22   # reflect_score retiré (faible importance SHAP+GNNExplainer)
 DRONE_FEAT_DIM = 3 + N_BANDS + N_BANDS  # = 51
 
+# reflect_score (ancien index 22) a été retiré. C'était la DERNIÈRE colonne, donc
+# les shards générés en 23-features restent compatibles : dataio.load_sharded_dataset
+# tronque la colonne excédentaire au chargement (pas besoin de régénérer le dataset).
 FEAT_KEYS = [
     "log_dist", "cos_ns", "rel_x", "rel_y", "rel_z",
     "log_height", "log_area", "normal_z", "log_horiz_dist",
@@ -194,7 +215,7 @@ FEAT_KEYS = [
     "obstacle_proximity", "slope_discontinuity",
     "normal_x", "normal_y", "cos_horiz",
     "is_occluded", "first_obstacle_frac", "log_n_intersections",
-    "log_dist_to_lit", "log_n_lit_nearby", "reflect_score",
+    "log_dist_to_lit", "log_n_lit_nearby",
 ]
 assert len(FEAT_KEYS) == NUM_FEATURES, "FEAT_KEYS doit avoir NUM_FEATURES entrées"
 

@@ -52,6 +52,10 @@ import os
 import sys
 from pathlib import Path
 
+# Réduit la fragmentation de l'allocateur CUDA (cartes 11 GiB) — doit être posé
+# AVANT le premier import de torch pour être pris en compte par le caching allocator.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 # repo root importable (models/GATv2/shap_analysis.py -> repo root)
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO_ROOT not in sys.path:
@@ -136,7 +140,8 @@ def load_model(ckpt_path: Path, device: torch.device):
         attn_dropout       = 0.0,
         num_layers         = a.get("num_layers", config.NUM_LAYERS),
         num_heads          = a.get("num_heads", config.NUM_HEADS),
-        grad_checkpoint    = False,
+        grad_checkpoint    = True,   # eval + grad activé → recompute les activations
+                                     # au backward au lieu de les stocker (cf. OOM 11 GiB)
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
@@ -148,6 +153,34 @@ def load_model(ckpt_path: Path, device: torch.device):
 # ─────────────────────────────────────────────────────────────────────────────
 def _forward_logits(model, x, edge_index, drone_feat, batch):
     return model(x, edge_index, drone_feat, batch)
+
+
+def attribute_graph(model, graph, device, *, n_baselines: int, n_alphas: int,
+                    max_nodes: int, rng: np.random.Generator):
+    """Attribution sur `device`, avec repli automatique sur CPU si l'OOM GPU
+    survient (analyse offline : on privilégie « ça finit » à la vitesse).
+
+    Le repli déplace temporairement le modèle sur CPU pour ce graphe, puis le
+    remet sur `device`. Idéal si le checkpointing (core.py) n'est pas actif ou
+    si un graphe est trop dense pour tenir en 11 GiB.
+    """
+    try:
+        return expected_gradients_graph(
+            model, graph, device, n_baselines=n_baselines,
+            n_alphas=n_alphas, max_nodes=max_nodes, rng=rng)
+    except torch.OutOfMemoryError:
+        if device.type != "cuda":
+            raise
+        torch.cuda.empty_cache()
+        log.warning("  OOM GPU sur ce graphe → repli sur CPU (plus lent).")
+        model.cpu()
+        try:
+            return expected_gradients_graph(
+                model, graph, torch.device("cpu"), n_baselines=n_baselines,
+                n_alphas=n_alphas, max_nodes=max_nodes, rng=rng)
+        finally:
+            model.to(device)
+            torch.cuda.empty_cache()
 
 
 def expected_gradients_graph(model, graph, device, *, n_baselines: int,
@@ -272,8 +305,13 @@ def make_plots(out_dir: Path, phi_all: np.ndarray, x_all: np.ndarray,
         fig.tight_layout()
         fig.savefig(out_dir / "02_beeswarm.png", dpi=140, bbox_inches="tight")
         plt.close(fig)
-    except Exception as e:
-        log.warning(f"Beeswarm shap ignoré ({e}).")
+    except Exception:
+        # Ne pas masquer la cause : le beeswarm échouait en silence (seul un
+        # warning laconique était émis). On loggue le traceback complet pour
+        # pouvoir diagnostiquer (versions shap/matplotlib, contenu des données…).
+        import traceback
+        log.warning("Beeswarm shap ignoré — traceback ci-dessous :\n"
+                    + traceback.format_exc())
 
     # ── 03 — heatmap importance par classe ───────────────────────────────────
     fig, ax = plt.subplots(figsize=(10, 9))
@@ -341,7 +379,7 @@ def main() -> None:
     # ── Boucle d'attribution ──────────────────────────────────────────────────
     phi_chunks, x_chunks, pred_chunks = [], [], []
     for k, gi in enumerate(idx, 1):
-        res = expected_gradients_graph(
+        res = attribute_graph(
             model, graphs[gi], device,
             n_baselines=args.n_baselines, n_alphas=args.n_alphas,
             max_nodes=args.max_nodes, rng=rng)

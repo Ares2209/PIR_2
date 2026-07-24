@@ -18,7 +18,7 @@ from pathlib import Path
 # ─────────────────────────────────────────────────────────────────────────────
 HIDDEN_CHANNELS = 128
 NUM_LAYERS      = 6
-NUM_HEADS       = 5
+NUM_HEADS       = 3
 ATTN_DROPOUT    = 0.2858666834614854
 DROPOUT         = 0.2
 
@@ -198,7 +198,6 @@ NODE_STATS: dict[str, tuple[float, float]] = {
     "log_n_intersections": (0.4,     0.6),
     "log_dist_to_lit":     (0.5,     0.5),
     "log_n_lit_nearby":    (2.0,     1.5),
-    "reflect_score":       (0.3,     0.2),
 }
 
 # Radius (mesh units) for the lit-neighbour ball query used by the
@@ -212,9 +211,12 @@ REFLECT_RADIUS = 0.05
 # Feature vector dimensions + canonical key order
 # ─────────────────────────────────────────────────────────────────────────────
 N_BANDS        = 24
-NUM_FEATURES   = 23
+NUM_FEATURES   = 22   # reflect_score retiré (faible importance SHAP+GNNExplainer)
 DRONE_FEAT_DIM = 3 + N_BANDS + N_BANDS  # = 51
 
+# reflect_score (ancien index 22) a été retiré. C'était la DERNIÈRE colonne, donc
+# les shards générés en 23-features restent compatibles : dataio.load_sharded_dataset
+# tronque la colonne excédentaire au chargement (pas besoin de régénérer le dataset).
 FEAT_KEYS = [
     "log_dist", "cos_ns", "rel_x", "rel_y", "rel_z",
     "log_height", "log_area", "normal_z", "log_horiz_dist",
@@ -222,7 +224,7 @@ FEAT_KEYS = [
     "obstacle_proximity", "slope_discontinuity",
     "normal_x", "normal_y", "cos_horiz",
     "is_occluded", "first_obstacle_frac", "log_n_intersections",
-    "log_dist_to_lit", "log_n_lit_nearby", "reflect_score",
+    "log_dist_to_lit", "log_n_lit_nearby",
 ]
 assert len(FEAT_KEYS) == NUM_FEATURES, "FEAT_KEYS doit avoir NUM_FEATURES entrées"
 

@@ -333,7 +333,10 @@ class GATv2(torch.nn.Module):
         # Fusion additive drone-signature (broadcast via batch index)
         h = self.node_proj(x) + self.drone_proj(drone_feat)[batch]
 
-        use_ckpt = self.grad_checkpoint and self.training
+        # Le checkpointing n'a d'intérêt que si un backward est construit : on le
+        # déclenche dès que l'autograd est actif (training OU attribution en eval),
+        # pas uniquement en self.training. En inference no_grad → jamais activé.
+        use_ckpt = self.grad_checkpoint and torch.is_grad_enabled()
 
         for conv, norm in zip(self.convs, self.norms):
             if use_ckpt:

@@ -1,0 +1,58 @@
+# GAT training run
+# started     : 2026-07-13 06:24:45
+# run dir     : /home/ldena/Bureau/PIR-local/PIR/models/GATv2/plots/run_20260713_062445
+# world size  : 1  (distributed=False)
+# device      : cuda
+
+## CLI args
+  batch_size       = 2
+  dropout          = 0.2
+  epochs           = 600
+  eval_batch_size  = 1
+  eval_every       = 5
+  grad_accum_steps = 8
+  grad_checkpoint  = True
+  grad_clip        = 1.0
+  hidden_channels  = 128
+  keep_old_ckpts   = 3
+  lr               = 0.0005407835674001513
+  lr_factor        = 0.5
+  lr_min           = 1e-06
+  lr_patience      = 10
+  min_delta        = 0.0001
+  num_heads        = 5
+  num_layers       = 6
+  patience         = 50
+  seed             = 42
+  split_seed       = 0
+  track_metric     = f1m,mcc
+  val_ratio        = 0.15
+  weight_decay     = 5.024783335894379e-06
+
+## Tracking metric
+  f1m,mcc
+
+## Class weights (CE loss)
+  class 0 (violet   ) : 0.6581
+  class 1 (blue     ) : 0.3402
+  class 2 (yellow   ) : 0.2034
+  class 3 (orange   ) : 1.5696
+  class 4 (red      ) : 4.0482
+  class 5 (dark_red ) : 5.7084
+  class 6 (occluded ) : 0.6899
+
+## Train class counts
+  class 0 (violet   ) :    9,551,066  (18.45%)
+  class 1 (blue     ) :   13,416,751  (25.92%)
+  class 2 (yellow   ) :    3,256,643  ( 6.29%)
+  class 3 (orange   ) :      859,797  ( 1.66%)
+  class 4 (red      ) :      134,675  ( 0.26%)
+  class 5 (dark_red ) :       12,973  ( 0.03%)
+  class 6 (occluded ) :   24,536,959  (47.40%)
+  TOTAL              :   51,768,864
+
+## Map-level split
+  train   (14 maps): ville, ville10, ville11, ville12, ville13, ville14, ville2, ville3, ville4, ville5, ville6, ville7, ville8, ville9
+  val     ( 4 maps): ville15, ville16, ville17, ville18
+  test    ( 4 maps): ville15, ville16, ville17, ville18
+
