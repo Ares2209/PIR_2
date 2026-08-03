@@ -7,7 +7,13 @@ and the early-stop / prune flags.
 
 Each trial samples a 7-dim class-weight vector, trains a fresh GAT for a
 reduced epoch budget, and reports the best value of the chosen validation
-metric (default: balanced accuracy).
+metric (default: f1m+mcc — the SAME metric the real training tracks).
+
+⚠ L'objectif DOIT rester aligné sur `track_metric` de l'entraînement réel.
+Optimiser `bal` seul (ancien défaut) maximise la moyenne des rappels sans
+regarder aucune précision : la recherche converge vers des poids qui font
+sur-prédire les classes rares (rappel ~0.98, précision ~0.37) et dégrade
+macro-F1. Voir le garde-fou d'objectif dans main().
 
 Pruning : the trial reports the metric at every `eval_every` epoch and
 Optuna's MedianPruner kills runs that look worse than the running median.
@@ -138,18 +144,26 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
     # Optuna
     p.add_argument("--n-trials", type=int, default=50)
-    p.add_argument("--study-name", type=str, default="gatv2-class-weights")
+    # NOTE: l'étude "gatv2-class-weights" (43 essais) a été optimisée sur `bal`
+    # et n'est pas réutilisable pour un autre objectif — d'où ce nom distinct.
+    p.add_argument("--study-name", type=str, default="gatv2-class-weights-f1m")
     p.add_argument("--storage", type=str, default=None,
                    help="Optuna storage URL. Default = sqlite under optuna_runs/.")
     p.add_argument("--seed", type=int, default=config.SEED)
-    p.add_argument("--metric", type=str, default="bal",
+    p.add_argument("--metric", type=str, default="f1m,mcc",
                    help="Comma-separated list of metrics to optimize "
                         "(maximised together via arithmetic mean). "
                         "Available: bal, acc, mcc, f1m, kap, rare. "
-                        "Examples: 'bal' | 'f1m' | 'bal,f1m'.")
+                        "Par défaut identique au track_metric de l'entraînement "
+                        "(f1m,mcc) — ne le changez qu'en connaissance de cause : "
+                        "'bal' seul ignore les précisions.")
     # Search space
     p.add_argument("--w-min", type=float, default=0.1)
-    p.add_argument("--w-max", type=float, default=30.0)
+    # 8.0 et non 30.0 : au-delà, les poids trouvés écrasent la classe majoritaire
+    # (c6 = 47% des nœuds) pour gonfler les rappels rares — configurations qu'on
+    # ne déploierait jamais, et qui diluent le budget d'essais dans un espace
+    # 7-D déjà trop grand.
+    p.add_argument("--w-max", type=float, default=8.0)
     p.add_argument("--normalize-weights", action=argparse.BooleanOptionalAction,
                    default=True)
     # Training budget per trial (smaller than the real run on purpose)
@@ -451,6 +465,50 @@ def main() -> None:
             load_if_exists=True,
         )
         metrics_preview = _parse_metrics(opts.metric)
+
+        # ── Garde-fou d'objectif ──────────────────────────────────────────────
+        # load_if_exists=True reprend une étude sans vérifier ce qu'elle
+        # optimisait. Mélanger deux objectifs dans une même base rend best_trial
+        # et le pruner (qui compare à la médiane) silencieusement faux. On grave
+        # donc l'objectif dans les user_attrs au premier essai et on refuse toute
+        # reprise incohérente.
+        canon = ",".join(sorted(n for n, _ in metrics_preview))
+        stored = study.user_attrs.get("metric")
+        if stored is None and study.trials:
+            # Étude antérieure au garde-fou : elle porte des essais dont on ne
+            # peut PAS déduire l'objectif. L'estampiller maintenant reviendrait à
+            # affirmer une chose invérifiable — on refuse.
+            raise SystemExit(
+                f"\n[objectif inconnu] L'étude '{opts.study_name}' contient "
+                f"{len(study.trials)} essais sans objectif enregistré : "
+                f"impossible de garantir qu'ils optimisaient '{canon}'.\n"
+                f"(Rappel : 'gatv2-class-weights' a été optimisée sur 'bal'.)\n"
+                f"→ Utilisez --study-name <nouveau_nom> pour repartir proprement."
+            )
+        if stored is None:
+            study.set_user_attr("metric", canon)
+            study.set_user_attr("w_min", opts.w_min)
+            study.set_user_attr("w_max", opts.w_max)
+        elif stored != canon:
+            raise SystemExit(
+                f"\n[objectif incohérent] L'étude '{opts.study_name}' a été "
+                f"optimisée sur '{stored}', or vous demandez '{canon}'.\n"
+                f"Ses essais ne sont pas comparables aux nouveaux (best_trial et "
+                f"MedianPruner deviendraient faux).\n"
+                f"→ Utilisez --study-name <nouveau_nom>, ou --metric {stored}."
+            )
+        else:
+            # Même objectif : l'espace de recherche doit aussi coïncider, sinon
+            # les essais repris n'échantillonnent pas le même domaine.
+            for key, cur in (("w_min", opts.w_min), ("w_max", opts.w_max)):
+                old = study.user_attrs.get(key)
+                if old is not None and old != cur:
+                    log.warning(
+                        f"[espace de recherche] {key}: étude={old} ≠ demandé={cur} "
+                        f"— les {len(study.trials)} essais existants ont été tirés "
+                        f"dans l'ancien domaine."
+                    )
+
         log.info(f"Study      : {opts.study_name}  ({storage})")
         log.info(
             f"Metric     : {'+'.join(n for n, _ in metrics_preview)}  "
